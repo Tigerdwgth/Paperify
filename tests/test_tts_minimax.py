@@ -126,36 +126,56 @@ def test_synthesize_tts_routes_minimax(monkeypatch):
     assert called == {"model": "speech-2.8-hd", "voice_id": "vx", "api_key": "sk-x"}
 
 
-def test_synthesize_tts_minimax_no_key_falls_back_dashscope(monkeypatch):
+def _forbid_dashscope(monkeypatch):
+    """MiniMax 的兜底已经从 dashscope 换成 Qwen-TTS, dashscope 一旦被调就是回归。"""
+    def _boom(*args, **kwargs):
+        raise AssertionError("MiniMax 兜底不应再走 dashscope(会中途变声)")
+    monkeypatch.setattr(audio_helpers, "_synthesize_dashscope", _boom)
+
+
+def test_synthesize_tts_minimax_no_key_falls_back_qwen(monkeypatch):
+    """缺 minimax key → 回退 Qwen-TTS 男声(QWEN_TTS_DEFAULT_VOICE), 不走 dashscope。"""
     monkeypatch.setattr(audio_helpers, "get_tts_config",
                         lambda: ("speech-2.8-hd", "male-qn-qingse"))
     monkeypatch.setattr(audio_helpers, "_resolve_minimax_key", lambda: None)
+    _forbid_dashscope(monkeypatch)
     captured = {}
-    def fake_dashscope(text, model, voice):
-        captured["model"] = model
+
+    def fake_qwen(text, model=None, voice=None):
+        captured["text"] = text
         captured["voice"] = voice
-        return b"DASHSCOPE_OK"
-    monkeypatch.setattr(audio_helpers, "_synthesize_dashscope", fake_dashscope)
+        return b"QWEN_OK"
+
+    monkeypatch.setattr(audio_helpers, "_synthesize_qwen", fake_qwen)
     out = audio_helpers.synthesize_tts("hi")
-    assert out == b"DASHSCOPE_OK"
-    assert captured["model"] == "cosyvoice-v2"
+    assert out == b"QWEN_OK"
+    assert captured["text"] == "hi"
+    assert captured["voice"] == audio_helpers.QWEN_TTS_DEFAULT_VOICE
 
 
-def test_synthesize_tts_minimax_failure_falls_back_dashscope(monkeypatch):
+def test_synthesize_tts_minimax_failure_falls_back_qwen(monkeypatch):
+    """MiniMax 调用失败 → 同样回退 Qwen-TTS 男声。"""
     monkeypatch.setattr(audio_helpers, "get_tts_config",
                         lambda: ("speech-2.8-hd", "vx"))
     monkeypatch.setattr(audio_helpers, "_resolve_minimax_key", lambda: "sk-x")
     monkeypatch.setattr(audio_helpers, "_resolve_minimax_voice", lambda: "vx")
+    _forbid_dashscope(monkeypatch)
     import src.utils.tts_minimax as mm
+
     def fake_synth_fail(text, *, api_key, model, voice_id):
         raise mm.MiniMaxTTSError("network down")
+
     monkeypatch.setattr(mm, "synthesize_minimax", fake_synth_fail)
-    monkeypatch.setattr(
-        audio_helpers, "_synthesize_dashscope",
-        lambda text, model, voice: b"FALLBACK"
-    )
+    captured = {}
+
+    def fake_qwen(text, model=None, voice=None):
+        captured["voice"] = voice
+        return b"QWEN_FALLBACK"
+
+    monkeypatch.setattr(audio_helpers, "_synthesize_qwen", fake_qwen)
     out = audio_helpers.synthesize_tts("hi")
-    assert out == b"FALLBACK"
+    assert out == b"QWEN_FALLBACK"
+    assert captured["voice"] == audio_helpers.QWEN_TTS_DEFAULT_VOICE
 
 
 def test_synthesize_tts_default_routes_dashscope(monkeypatch):

@@ -101,34 +101,43 @@ def test_gather_hf_mock():
 # 3. arxiv 数据源
 # ---------------------------------------------------------------------
 
+def _fake_arxiv_paper(link: str, days_ago: int, title: str = "Embodied AI Robot"):
+    """构造一篇 mock arxiv 论文; 日期相对今天, 否则会被 days 窗口过滤掉。"""
+    import datetime
+    from src.get_arxiv_latest import Paper
+    ts = datetime.datetime.now() - datetime.timedelta(days=days_ago)
+    stamp = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return Paper(title=title, authors=["A", "B"], abstract="VLA paper",
+                 link=link, announced_date=stamp, submitted_date=stamp,
+                 comments=""), ts.strftime("%Y-%m-%d")
+
+
 def test_gather_arxiv_mock():
     """mock get_latest_embodied_ai_papers → Candidate 列表。"""
-    from src.get_arxiv_latest import Paper
-    fake_papers = [
-        Paper(title="Embodied AI Robot",
-              authors=["A", "B"],
-              abstract="VLA paper",
-              link="https://arxiv.org/abs/2410.11758",
-              announced_date="2026-04-22T00:00:00Z",
-              submitted_date="2026-04-22T00:00:00Z",
-              comments=""),
-        Paper(title="Survey on Foo",
-              authors=["C"],
-              abstract="A survey",
-              link="https://arxiv.org/abs/2411.00001",
-              announced_date="2026-04-21T00:00:00Z",
-              submitted_date="2026-04-21T00:00:00Z",
-              comments=""),
-    ]
+    p1, day1 = _fake_arxiv_paper("https://arxiv.org/abs/2410.11758", days_ago=1)
+    p2, _ = _fake_arxiv_paper("https://arxiv.org/abs/2411.00001", days_ago=2,
+                              title="Survey on Foo")
     with patch("src.discovery_sources.arxiv_recent.get_latest_embodied_ai_papers",
-               return_value=fake_papers):
+               return_value=[p1, p2]):
         from src.discovery_sources import fetch_arxiv_recent
         cands = fetch_arxiv_recent(tags=["cs.RO"], days=7, limit=10)
     assert len(cands) == 2
     assert cands[0].arxiv_id == "2410.11758"
     assert cands[0].source == "arxiv"
     assert cands[0].github_repo is None  # arxiv 不给 github 字段
-    assert cands[0].submitted_date == "2026-04-22"
+    assert cands[0].submitted_date == day1
+
+
+def test_gather_arxiv_filters_outside_days_window():
+    """超出 days 窗口的论文会被 cutoff 过滤掉(只保留窗口内的)。"""
+    fresh, _ = _fake_arxiv_paper("https://arxiv.org/abs/2410.11758", days_ago=1)
+    stale, _ = _fake_arxiv_paper("https://arxiv.org/abs/2411.00001", days_ago=40,
+                                 title="Old Paper")
+    with patch("src.discovery_sources.arxiv_recent.get_latest_embodied_ai_papers",
+               return_value=[fresh, stale]):
+        from src.discovery_sources import fetch_arxiv_recent
+        cands = fetch_arxiv_recent(tags=["cs.RO"], days=7, limit=10)
+    assert [c.arxiv_id for c in cands] == ["2410.11758"]
 
 
 # ---------------------------------------------------------------------

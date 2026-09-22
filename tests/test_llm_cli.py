@@ -228,12 +228,18 @@ def test_via_skill_env_var_triggered(monkeypatch):
         "results": {"script": "skill r", "text": "skill r"},
     }
 
+    # skill 返回后, generate_structured_video_plan 还会跑一次公式提取
+    # (_extract_core_formulas → create_chat_completion), 不 mock 就会打真实 DeepSeek。
     with patch.object(llm_agent, "_call_video_plan_skill",
-                       return_value=fake_legacy_plan) as m_skill:
+                       return_value=fake_legacy_plan) as m_skill, \
+         patch.object(llm_agent, "create_chat_completion",
+                       return_value='{"formulas": []}') as m_chat:
         plan = llm_agent.generate_structured_video_plan(
             text=None, paper_title="X", paper_abstract="Y",
         )
     assert m_skill.called, "env=1 时应触发 skill 路径"
+    assert plan.get("formulas") == [], "公式提取返回空数组时 plan.formulas 应为空"
+    assert m_chat.called, "公式提取应走 create_chat_completion(已被 mock, 不打真实 API)"
     assert plan.get("opening", {}).get("script") == "skill o"
 
 

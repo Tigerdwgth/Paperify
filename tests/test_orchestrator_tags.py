@@ -1,11 +1,13 @@
 """测试 orchestrator.upload_generated_content 的 tags_per_platform 路由。
 
-仅 mock B站 / 小红书的 upload 实现，不真的调上传，验证 tag 透传逻辑。
+仅 mock B站 / 小红书的 upload 实现(小红书还要 mock 掉 chromium 卡片渲染),
+不真的调上传, 验证 tag 透传逻辑。
 """
-import pytest
-from unittest.mock import patch, MagicMock
 import os
 import tempfile
+from unittest.mock import patch
+
+FAKE_CARDS = ["/tmp/fake_card_00.png"]
 
 
 def _make_video_file():
@@ -30,10 +32,7 @@ def test_bilibili_tags_per_platform_takes_priority():
                 video_title="标题", video_tags="老,关键词", video_desc="desc",
                 tags_per_platform={"bilibili": ["VLA", "具身智能", "机器人"]},
             )
-            args, kwargs = mock_bili.call_args
-            tags = kwargs.get("tags") or args[2] if len(args) > 2 else None
-            # 实际取传到 upload_bilibili 的 tags 参数
-            assert kwargs.get("tags") == ["VLA", "具身智能", "机器人"]
+            assert mock_bili.call_args.kwargs["tags"] == ["VLA", "具身智能", "机器人"]
     finally:
         os.unlink(video)
 
@@ -56,10 +55,15 @@ def test_bilibili_falls_back_to_video_tags_when_no_tpp():
 
 
 def test_xhs_tags_per_platform_takes_priority():
-    """小红书 tags_per_platform.xiaohongshu 优先于 xhs_tags + 兜底"""
+    """小红书 tags_per_platform.xiaohongshu 优先于 xhs_tags + 兜底。
+
+    小红书只发图文卡片, 标签落在 publish_note 上。
+    """
     video = _make_video_file()
     try:
-        with patch("src.distribution.orchestrator._upload_xiaohongshu_video_impl",
+        with patch("src.distribution.xhs_cards.render_note_cards",
+                   return_value=FAKE_CARDS), \
+             patch("src.distribution.orchestrator._upload_xiaohongshu_note_impl",
                    return_value={"note_id": "n1"}) as mock_xhs:
             from src.distribution.orchestrator import upload_generated_content
             upload_generated_content(
@@ -84,7 +88,9 @@ def test_xhs_uses_fallback_when_nothing_supplied():
     """tags_per_platform 和 xhs_tags 都没传时使用 XHS_FALLBACK_TAGS"""
     video = _make_video_file()
     try:
-        with patch("src.distribution.orchestrator._upload_xiaohongshu_video_impl",
+        with patch("src.distribution.xhs_cards.render_note_cards",
+                   return_value=FAKE_CARDS), \
+             patch("src.distribution.orchestrator._upload_xiaohongshu_note_impl",
                    return_value={"note_id": "n1"}) as mock_xhs:
             from src.distribution.orchestrator import (
                 upload_generated_content, XHS_FALLBACK_TAGS,

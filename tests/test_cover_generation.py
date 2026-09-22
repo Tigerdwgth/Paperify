@@ -3,7 +3,7 @@
 覆盖范围：
 - Bug 1: 多篇论文时封面不再在循环内被覆盖
 - Bug 2: generate_cover 异常不会中断主流程
-- Bug 3: 小红书视频上传时缺少封面参数的日志提示
+- Bug 3: 小红书视频封面(MCP 不吃 cover 参数, 改成 ffmpeg 拼进视频开头)
 """
 
 import logging
@@ -44,58 +44,84 @@ def _import_generate_cover():
 
 
 class TestGenerateCover:
-    """测试 generate_cover 函数的基本行为。"""
+    """测试 generate_cover 的基本行为。
 
-    def test_generate_cover_creates_file(self, tmp_path):
-        """正常情况下应生成封面 PNG 文件。"""
+    当前实现(src/generate_cover.py): 标题由 AI 直接画进画面 ——
+    优先 Gemini 生图, 回退 DashScope, 两者都拿不到图时退回传入的原始图片,
+    产物统一 resize 成 1280x720(不再用 PIL 叠字, 也不再有 FONT_PATH)。
+
+    两个 AI 生图函数在测试里一律被替换: 既不打真实网络(它们会调 Google /
+    DashScope 的生图接口), 又能分别覆盖"AI 可用"和"全部回退"两条分支。
+    """
+
+    @staticmethod
+    def _module():
+        _import_generate_cover()  # 确保 src/ 在 sys.path 里
+        import generate_cover as gc_module
+        return gc_module
+
+    @staticmethod
+    def _disable_ai(monkeypatch, gc_module):
+        monkeypatch.setattr(gc_module, "_generate_cover_gemini", lambda *a, **k: "")
+        monkeypatch.setattr(gc_module, "_generate_cover_dashscope", lambda *a, **k: "")
+
+    def test_generate_cover_falls_back_to_source_image(self, tmp_path, monkeypatch):
+        """AI 生图都不可用时, 回退原始图片并落盘封面。"""
         from PIL import Image
+
+        gc_module = self._module()
+        self._disable_ai(monkeypatch, gc_module)
 
         bg_path = str(tmp_path / "bg.png")
-        Image.new("RGB", (200, 150), color="blue").save(bg_path)
-
+        Image.new("RGB", (200, 150), color=(0, 0, 255)).save(bg_path)
         output_path = str(tmp_path / "cover.png")
 
-        # 先导入模块使其存在于 sys.modules 中，再 patch
-        generate_cover_func = _import_generate_cover()
-        import generate_cover as gc_module
-        font_path = _get_any_font_path()
-        original = gc_module.FONT_PATH
-        try:
-            gc_module.FONT_PATH = font_path
-            generate_cover_func(bg_path, "测试标题", output_path)
-        finally:
-            gc_module.FONT_PATH = original
+        gc_module.generate_cover(bg_path, "测试标题", output_path)
 
         assert os.path.exists(output_path), "封面文件应被创建"
+        assert Image.open(output_path).getpixel((640, 360)) == (0, 0, 255), "应回退到原始图片"
 
-    def test_generate_cover_bad_image_raises(self, tmp_path):
-        """传入不存在的图片路径时应抛出异常。"""
-        generate_cover = _import_generate_cover()
-
-        with pytest.raises(Exception):
-            generate_cover("/nonexistent/bg.png", "标题", str(tmp_path / "out.png"))
-
-    def test_generate_cover_output_size(self, tmp_path):
-        """生成的封面图片尺寸应为 1200x900。"""
+    def test_generate_cover_prefers_ai_image(self, tmp_path, monkeypatch):
+        """Gemini 返回图片时用 AI 图, 不用原始图片。"""
         from PIL import Image
+
+        gc_module = self._module()
+        ai_path = str(tmp_path / "ai.png")
+        Image.new("RGB", (300, 200), color=(0, 255, 0)).save(ai_path)
+        monkeypatch.setattr(gc_module, "_generate_cover_gemini", lambda *a, **k: ai_path)
+        monkeypatch.setattr(gc_module, "_generate_cover_dashscope", lambda *a, **k: "")
+
+        bg_path = str(tmp_path / "bg.png")
+        Image.new("RGB", (200, 150), color=(0, 0, 255)).save(bg_path)
+        output_path = str(tmp_path / "cover.png")
+
+        gc_module.generate_cover(bg_path, "测试标题", output_path)
+
+        assert Image.open(output_path).getpixel((640, 360)) == (0, 255, 0), "应使用 AI 生成的封面"
+
+    def test_generate_cover_output_size(self, tmp_path, monkeypatch):
+        """生成的封面图片尺寸应为 1280x720。"""
+        from PIL import Image
+
+        gc_module = self._module()
+        self._disable_ai(monkeypatch, gc_module)
 
         bg_path = str(tmp_path / "bg.png")
         Image.new("RGB", (400, 300), color="red").save(bg_path)
-
         output_path = str(tmp_path / "cover.png")
 
-        generate_cover_func = _import_generate_cover()
-        import generate_cover as gc_module
-        font_path = _get_any_font_path()
-        original = gc_module.FONT_PATH
-        try:
-            gc_module.FONT_PATH = font_path
-            generate_cover_func(bg_path, "尺寸测试", output_path)
-        finally:
-            gc_module.FONT_PATH = original
+        gc_module.generate_cover(bg_path, "尺寸测试", output_path)
 
         img = Image.open(output_path)
-        assert img.size == (1200, 900), f"封面尺寸应为 (1200, 900)，实际为 {img.size}"
+        assert img.size == (1280, 720), f"封面尺寸应为 (1280, 720)，实际为 {img.size}"
+
+    def test_generate_cover_bad_image_raises(self, tmp_path, monkeypatch):
+        """AI 不可用且原始图片也不存在 → 抛异常, 不静默产出坏封面。"""
+        gc_module = self._module()
+        self._disable_ai(monkeypatch, gc_module)
+
+        with pytest.raises(Exception):
+            gc_module.generate_cover("/nonexistent/bg.png", "标题", str(tmp_path / "out.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -215,88 +241,89 @@ class TestCoverErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# Bug 3: 小红书视频上传无封面的日志提示
+# Bug 3: 小红书视频封面处理
 # ---------------------------------------------------------------------------
 
-class TestXiaohongshuCoverWarning:
-    """验证小红书视频上传时有封面不支持的日志提示。"""
+class TestXiaohongshuVideoCover:
+    """小红书视频封面: MCP 的 publish_with_video 不吃 cover 参数,
+    当前实现改成用 ffmpeg 把封面拼到视频开头(小红书自动取首帧当封面)。
+    """
 
-    def test_publish_video_logs_cover_warning(self, caplog):
-        """传入 cover_path 时，应输出 warning 日志说明 MCP 不支持 cover 参数。"""
+    _FAKE_RESULT = {"content": [{"type": "text", "text": '{"note_id": "n1"}'}]}
+
+    @staticmethod
+    def _fake_mount(path, subdir="images"):
+        return "/app/%s/%s" % (subdir, os.path.basename(path))
+
+    def test_publish_video_prepends_cover_to_video(self, tmp_path):
+        """传入存在的 cover_path → 封面拼进视频开头, 发布拼好的那个视频。"""
         from src.distribution.xiaohongshu import XiaohongshuMCPUploader
 
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"x")
+        cover = tmp_path / "c.png"
+        cover.write_bytes(b"x")
+        patched_video = str(tmp_path / "v_with_cover.mp4")
+        prepend_calls = {}
+
+        def fake_prepend(video_path, cover_path, duration=1.5):
+            prepend_calls["video"] = video_path
+            prepend_calls["cover"] = cover_path
+            return patched_video
+
         uploader = XiaohongshuMCPUploader()
+        with mock.patch("src.distribution.xiaohongshu._prepend_cover_to_video",
+                        side_effect=fake_prepend), \
+             mock.patch("src.distribution.xiaohongshu._copy_to_docker_mount",
+                        side_effect=self._fake_mount), \
+             mock.patch("src.distribution.xiaohongshu._call_tool",
+                        return_value=self._FAKE_RESULT) as m_call:
+            uploader.publish_video(title="测试", content="测试内容",
+                                   video_path=str(video), cover_path=str(cover))
 
-        with mock.patch("src.distribution.xiaohongshu.ensure_mcp_service", return_value=True), \
-             mock.patch("src.distribution.xiaohongshu._ensure_mcp_session", return_value=True), \
-             mock.patch("src.distribution.xiaohongshu._copy_to_docker_mount", return_value="/app/data/video.mp4"), \
-             mock.patch("src.distribution.xiaohongshu._call_tool", return_value={"content": [{"type": "text", "text": '{"note_id": "test123"}'}]}), \
-             caplog.at_level(logging.WARNING, logger="src.distribution.xiaohongshu"):
+        assert prepend_calls == {"video": str(video), "cover": str(cover)}
+        tool_name, arguments = m_call.call_args.args[0], m_call.call_args.args[1]
+        assert tool_name == "publish_with_video"
+        assert arguments["video"] == "/app/data/v_with_cover.mp4", "应发布拼了封面的视频"
+        assert "cover" not in arguments, "MCP publish_with_video 不支持 cover 参数"
 
-            uploader.publish_video(
-                title="测试",
-                content="测试内容",
-                video_path="/tmp/test.mp4",
-                cover_path="/tmp/cover.png",
-            )
-
-        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        cover_warnings = [m for m in warning_messages if "cover" in m.lower() or "封面" in m]
-        assert len(cover_warnings) > 0, (
-            f"传入 cover_path 时应有封面不支持的 warning 日志，实际日志: {warning_messages}"
-        )
-
-    def test_publish_video_no_warning_without_cover(self, caplog):
-        """不传入 cover_path 时，不应输出封面相关的 warning。"""
+    def test_publish_video_without_cover_keeps_original_video(self, tmp_path):
+        """不传 cover_path → 不走 ffmpeg 拼接, 直接发原视频。"""
         from src.distribution.xiaohongshu import XiaohongshuMCPUploader
 
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"x")
+
         uploader = XiaohongshuMCPUploader()
+        with mock.patch("src.distribution.xiaohongshu._prepend_cover_to_video") as m_prepend, \
+             mock.patch("src.distribution.xiaohongshu._copy_to_docker_mount",
+                        side_effect=self._fake_mount), \
+             mock.patch("src.distribution.xiaohongshu._call_tool",
+                        return_value=self._FAKE_RESULT) as m_call:
+            uploader.publish_video(title="测试", content="测试内容",
+                                   video_path=str(video), cover_path=None)
 
-        with mock.patch("src.distribution.xiaohongshu.ensure_mcp_service", return_value=True), \
-             mock.patch("src.distribution.xiaohongshu._ensure_mcp_session", return_value=True), \
-             mock.patch("src.distribution.xiaohongshu._copy_to_docker_mount", return_value="/app/data/video.mp4"), \
-             mock.patch("src.distribution.xiaohongshu._call_tool", return_value={"content": [{"type": "text", "text": '{"note_id": "test123"}'}]}), \
-             caplog.at_level(logging.WARNING, logger="src.distribution.xiaohongshu"):
+        m_prepend.assert_not_called()
+        arguments = m_call.call_args.args[1]
+        assert arguments["video"] == "/app/data/v.mp4"
+        assert "cover" not in arguments
 
-            uploader.publish_video(
-                title="测试",
-                content="测试内容",
-                video_path="/tmp/test.mp4",
-                cover_path=None,
-            )
+    def test_publish_video_ignores_missing_cover_file(self, tmp_path):
+        """cover_path 指向不存在的文件 → 当没传处理, 不调 ffmpeg。"""
+        from src.distribution.xiaohongshu import XiaohongshuMCPUploader
 
-        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        cover_warnings = [m for m in warning_messages if "publish_with_video" in m and "cover" in m.lower()]
-        assert len(cover_warnings) == 0, (
-            f"不传 cover_path 时不应有封面 warning，实际: {cover_warnings}"
-        )
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"x")
 
-    def test_xiaohongshu_source_has_cover_warning(self):
-        """xiaohongshu.py 源码中 publish_video 应包含 cover 不支持的日志。"""
-        xhs_path = os.path.join(ROOT, "src", "distribution", "xiaohongshu.py")
-        source = _read_source(xhs_path)
+        uploader = XiaohongshuMCPUploader()
+        with mock.patch("src.distribution.xiaohongshu._prepend_cover_to_video") as m_prepend, \
+             mock.patch("src.distribution.xiaohongshu._copy_to_docker_mount",
+                        side_effect=self._fake_mount), \
+             mock.patch("src.distribution.xiaohongshu._call_tool",
+                        return_value=self._FAKE_RESULT) as m_call:
+            uploader.publish_video(title="测试", content="测试内容",
+                                   video_path=str(video),
+                                   cover_path=str(tmp_path / "not_exist.png"))
 
-        # 确认 publish_video 方法中有 cover 相关的 warning
-        assert "publish_with_video" in source and "cover" in source.lower(), \
-            "xiaohongshu.py 中应有 cover 参数不支持的说明"
-
-        # 更具体：确认有 logger.warning 且提到 cover
-        assert "logger.warning" in source, "应有 logger.warning 调用"
-
-
-# ---------------------------------------------------------------------------
-# 辅助函数
-# ---------------------------------------------------------------------------
-
-def _get_any_font_path() -> str:
-    """获取一个可用的字体路径（用于测试）。"""
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        os.path.join(ROOT, "font", "SIMHEI.TTF"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return candidates[-1]
+        m_prepend.assert_not_called()
+        assert m_call.call_args.args[1]["video"] == "/app/data/v.mp4"

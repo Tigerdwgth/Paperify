@@ -4,6 +4,11 @@
 mock 不友好（CLI 重新拉新进程），所以三个子命令分别用 ``--limit 1`` /
 ``--limit 2`` 控制网络压力。失败时（网络不通 / 服务器 503）也允许 ``ok=false``，
 但 stdout 必须仍是合法 JSON 且字段齐。
+
+注意: 真打 arxiv / HuggingFace 的三个子命令标了 ``smoke``——子进程在
+tests/conftest.py 的网络防线之外, 默认跑全量时不许它们摸真实外网
+(实测 hf-daily 一条就要 40s), 需要时用 ``pytest -m smoke`` 显式跑。
+argparse 层的契约测试不碰网络, 保持默认执行。
 """
 from __future__ import annotations
 
@@ -52,6 +57,7 @@ def _assert_json_contract(stdout: str, stderr: str, returncode: int):
     return payload
 
 
+@pytest.mark.smoke
 def test_cli_arxiv_search_returns_json():
     """``arxiv-search --query <topic> --limit 2`` 应返回 JSON contract。"""
     rc, out, err = _run_cli(
@@ -69,6 +75,7 @@ def test_cli_arxiv_search_returns_json():
             assert "source" in p
 
 
+@pytest.mark.smoke
 def test_cli_arxiv_by_venue_returns_json():
     """``arxiv-by-venue --venue RSS --year 2025 --limit 5`` 应返回 JSON contract。"""
     rc, out, err = _run_cli(
@@ -82,6 +89,7 @@ def test_cli_arxiv_by_venue_returns_json():
             assert p["source"] == "arxiv_venue"
 
 
+@pytest.mark.smoke
 def test_cli_hf_daily_returns_json():
     """``hf-daily --limit 3`` 应返回 JSON contract。"""
     rc, out, err = _run_cli(
