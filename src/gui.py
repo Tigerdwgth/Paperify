@@ -8,13 +8,13 @@ def process_arxiv_summary(query, max_papers, long_or_short, status=gr.Progress()
     try:
         # 输入验证
         if not query or not isinstance(query, str) or len(query.strip()) == 0:
-            return "❌ 请输入有效的查询关键词！", None, None, None
+            return "❌ 请输入有效的查询关键词！", None, None, gr.update(visible=False)
         
         if not isinstance(max_papers, (int, float)) or max_papers < 1 or max_papers > 20:
-            return "❌ 最大论文数应为 1~20 的整数！", None, None, None
+            return "❌ 最大论文数应为 1~20 的整数！", None, None, gr.update(visible=False)
             
         if long_or_short not in ["long", "short"]:
-            return "❌ 摘要类型只能为 long 或 short！", None, None, None
+            return "❌ 摘要类型只能为 long 或 short！", None, None, gr.update(visible=False)
         
         # 准备工作
         status(0.1, desc="正在准备...")
@@ -43,7 +43,7 @@ def process_arxiv_summary(query, max_papers, long_or_short, status=gr.Progress()
         
         # 检查生成的文件
         if not path or not os.path.exists(path):
-            return "❌ 视频生成失败：文件不存在", None, None, None
+            return "❌ 视频生成失败：文件不存在", None, None, gr.update(visible=False)
             
         # 准备返回信息
         info_text = f"""✅ 视频生成成功！
@@ -126,7 +126,7 @@ with gr.Blocks(title="具身人机 Arxiv 视频生成器", theme=gr.themes.Soft(
                 size="lg"
             )
             
-            gr.Markdown("### � 常用查询示例")
+            gr.Markdown("### 💡 常用查询示例")
             gr.Examples([
                 ["cs.RO", 3, "long"],
                 ["embodied AI", 2, "short"],
@@ -147,57 +147,37 @@ with gr.Blocks(title="具身人机 Arxiv 视频生成器", theme=gr.themes.Soft(
                 interactive=False,
                 placeholder="点击'生成视频'开始处理..."
             )
-if __name__ == "__main__":
-    # 配置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('app.log', encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
-    
-    demo.launch(
-        show_error=True,
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        debug=True
-    )
-        logging.info("程序结束")
-        logging.shutdown()
 
-# 创建 Gradio 界面
-with gr.Blocks(title="具身人机 Arxiv 视频生成器") as demo:
-    gr.Markdown("""
-    # 具身人机 Arxiv 视频生成器
-    输入关键词，自动生成并上传具身智能相关论文摘要视频到 Bilibili。
-    """)
-    with gr.Row():
-        with gr.Column():
-            query_input = gr.Textbox(label="查询关键词", placeholder="如 'cs.RO'，可输入 arxiv 分类或关键词", value="cs.RO", lines=1)
-            max_papers_input = gr.Number(label="最大论文数 (1~20)", value=3, precision=0, minimum=1, maximum=20)
-            long_or_short_input = gr.Radio([
-                "long", "short"
-            ], label="摘要类型", value="long", interactive=True)
-            submit_btn = gr.Button("生成并上传")
-        with gr.Column():
-            output_text = gr.Textbox(label="运行结果", lines=6, interactive=False)
-    gr.Examples([
-        ["cs.RO", 3, "long"],
-        ["embodied AI", 2, "short"],
-        ["robotics", 1, "long"]
-    ],
-        inputs=[query_input, max_papers_input, long_or_short_input],
-        label="示例"
-    )
+            video_output = gr.Video(label="🎬 视频预览")
+
+            with gr.Group(visible=False) as download_group:
+                file_output = gr.File(label="⬇️ 下载视频文件")
+
     submit_btn.click(
         process_arxiv_summary,
         inputs=[query_input, max_papers_input, long_or_short_input],
-        outputs=output_text,
-        api_name="arxiv2bili"
+        outputs=[output_text, video_output, file_output, download_group],
+        api_name="arxiv2bili",
     )
 
+
 if __name__ == "__main__":
-    demo.launch(show_error=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler("app.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+    try:
+        demo.launch(
+            show_error=True,
+            server_name="0.0.0.0",
+            server_port=int(os.environ.get("JSR_GUI_PORT", "7860")),
+            share=False,
+        )
+    finally:
+        logging.info("程序结束")
+        logging.shutdown()
