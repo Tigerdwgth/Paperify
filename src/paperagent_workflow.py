@@ -74,7 +74,7 @@ def _clean_pipeline_cache(cache_dir="./cache", pic_dir="./pic",
         "summary*.wav", "expl_*.wav", "test_audio_*.wav",
         "image_explanations*.json",
         "paper_text.txt", "structured_plan.json",
-        "cached_pdf.pdf",
+        "cached_pdf.pdf", "cached_pdf.meta.json",
         "dashscope_cover.png", "gemini_cover.png", "ai_cover_bg.png",
     ]
     for pattern in cache_patterns:
@@ -105,7 +105,40 @@ def _clean_pipeline_cache(cache_dir="./cache", pic_dir="./pic",
         except OSError:
             pass
 
+    frames_dir = os.path.join(
+        os.path.dirname(manim_presentation), "scene_frames")
+    if os.path.exists(frames_dir):
+        _shutil.rmtree(frames_dir, ignore_errors=True)
+        logging.info("已清理旧 scene 帧目录: %s", frames_dir)
+    narration_json = os.path.join(
+        os.path.dirname(manim_presentation), "narration_segments.json")
+    if os.path.exists(narration_json):
+        try:
+            os.remove(narration_json)
+            logging.info("已清理旧旁白段落: %s", narration_json)
+        except OSError:
+            pass
+
     logging.info("Pipeline 缓存清理完成（全量）")
+
+
+# ---- 文件名净化 ----
+# LLM 生成的标题常含 "Vision/Language" 这类字符，直接拼进输出路径会指向不存在的子目录
+_FILENAME_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|]')
+
+
+def sanitize_filename(name: str, fallback: str = "untitled") -> str:
+    """净化文件名片段：剔除路径非法字符，清空后回落到 fallback。
+
+    Args:
+        name: 原始名字（通常是 LLM 生成的标题）
+        fallback: 净化后为空时使用的名字
+
+    Returns:
+        str: 可安全拼进路径的文件名片段
+    """
+    cleaned = _FILENAME_ILLEGAL_RE.sub('', name or '').strip()
+    return cleaned or fallback
 
 
 # ---- 时长预算常量 ----
@@ -138,6 +171,35 @@ def compute_word_budget(target_duration: int = 300, num_images: int = MAX_IMAGES
         "images": image_budget,
         "per_image": per_image,
     }
+
+
+def _select_top_images_with_contexts(images: list, scores: list, contexts,
+                                     top_n: int = MAX_IMAGES_DEFAULT):
+    """按重要性挑选图片，并把 contexts 的键重映射到筛选后列表的新位置。
+
+    contexts 的键是原始 1-based 图号，而 ImageAgent.explain_images 是按筛选后
+    列表的位置取题注（idx + 1）。挑选是「抽取」而非「前缀截断」，不重映射会让
+    题注和图片系统性错配。
+
+    Args:
+        images: 原始图片列表
+        scores: 与 images 等长的重要性分数
+        contexts: 原始 1-based 图号 -> 题注；None / 空则原样返回
+        top_n: 保留张数
+
+    Returns:
+        tuple: (筛选后的图片列表, 重映射后的 contexts)
+    """
+    kept_indices = select_top_images(list(range(len(images))), scores, top_n=top_n)
+    selected = [images[i] for i in kept_indices]
+    if not contexts:
+        return selected, contexts
+    remapped = {}
+    for new_pos, old_idx in enumerate(kept_indices):
+        caption = contexts.get(old_idx + 1)
+        if caption is not None:
+            remapped[new_pos + 1] = caption
+    return selected, remapped
 
 
 def extract_abstract_from_text(raw_text: str, limit: int = 1500) -> str:
@@ -230,7 +292,12 @@ def run_pdf_to_video_pipeline(paper=None,pdf_file_path=None,demowebsite=None,en_
     if not pdf_file_path:
         pdf_file_path, demowebsite = get_inputs()
     # 如果是网络路径，下载到本地
+    _pdf_source = pdf_file_path
     pdf_file_path = download_if_remote(pdf_file_path)
+    # download_if_remote 以 -1 表示失败（与 generate_daily_arxiv_summary 的约定一致），
+    # 不拦住会把 -1 当路径喂进 PDFProcessor
+    if not pdf_file_path or pdf_file_path == -1:
+        raise RuntimeError(f"无法下载或找到 PDF 文件: {_pdf_source}")
     logging.info("文件存在，开始处理PDF")
     # 创建PDF处理器实例
     pdf_processor = PDFProcessor(pdf_file_path)
@@ -243,6 +310,9 @@ def run_pdf_to_video_pipeline(paper=None,pdf_file_path=None,demowebsite=None,en_
     if not paper_abstract:
         paper_abstract = extract_abstract_from_text(text)
     images = process_pdf_images(pdf_processor)
+    # 预绑定：下面的 try 可能在 ImageAgent() 就抛异常，而这两个名字在 except 之后仍会被读取
+    paper_core_summary = text
+    explanations = None
     # 尝试使用 qwen-vl 对图片做解释（如果可用）
     try:
         os.makedirs('./cache', exist_ok=True)
@@ -277,7 +347,8 @@ def run_pdf_to_video_pipeline(paper=None,pdf_file_path=None,demowebsite=None,en_
                     cap = contexts.get(img_idx + 1, f"Figure {img_idx + 1}") if contexts else f"Figure {img_idx + 1}"
                     captions_for_rating.append(cap)
                 scores = rate_image_importance(captions_for_rating)
-                images = select_top_images(images, scores, top_n=MAX_IMAGES_DEFAULT)
+                images, contexts = _select_top_images_with_contexts(
+                    images, scores, contexts, top_n=MAX_IMAGES_DEFAULT)
                 logging.info(f"筛选后保留 {len(images)} 张图片")
             except Exception as e:
                 logging.warning(f"图片筛选失败，使用前 {MAX_IMAGES_DEFAULT} 张: {e}")
@@ -356,13 +427,15 @@ def run_pdf_to_video_pipeline(paper=None,pdf_file_path=None,demowebsite=None,en_
             with open('./cache/image_explanations.json', 'r', encoding='utf-8') as f:
                 image_explanations = json.load(f)
         else:
-            image_explanations = globals().get('explanations', None)
-    except Exception:
-        image_explanations = globals().get('explanations', None)
+            # 回退到内存里刚算出的解释（explanations 在上面的 try 里生成，失败时为 None）
+            image_explanations = explanations
+    except Exception as e:
+        logging.warning("读取图像解释缓存失败，回退到内存结果: %s", e)
+        image_explanations = explanations
 
     # 将结构化脚本传入 VideoCreator，用于语义匹配图文对应
     video_creator = VideoCreator(images, summary, videos, image_explanations=image_explanations, target_duration=target_duration, structured_plan=structured_plan)
-    save_path = f"./output/{title}.mp4"
+    save_path = f"./output/{sanitize_filename(title, 'video')}.mp4"
     video_path = video_creator.create_video(save_path)
     if not video_path or not os.path.exists(video_path):
         raise RuntimeError(f"视频创建失败，输出文件不存在: {save_path}")
@@ -435,6 +508,31 @@ def process_pdf_images(pdf_processor,cnt=None):
         images = [Image.open(image) for image in images]
     return images
 
+def _pdf_cache_meta_path(cache_path: str) -> str:
+    """PDF 缓存的元数据路径，元数据里记录来源 URL，作为缓存键。"""
+    return os.path.splitext(cache_path)[0] + ".meta.json"
+
+
+def _read_pdf_cache_url(meta_path: str) -> str:
+    """读取缓存 PDF 的来源 URL；元数据缺失或损坏时返回空串（视为未命中）。"""
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    return meta.get("url", "") if isinstance(meta, dict) else ""
+
+
+def _write_pdf_cache_url(meta_path: str, url: str) -> None:
+    """记录本次下载的来源 URL，供下次缓存命中判断。"""
+    try:
+        os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"url": url}, f, ensure_ascii=False)
+    except OSError as e:
+        logging.warning("写入 PDF 缓存元数据失败: %s", e)
+
+
 def download_if_remote(pdf_file_path):
     """
     检查并下载远程 PDF 文件。
@@ -451,18 +549,23 @@ def download_if_remote(pdf_file_path):
 
     注意：
     - 下载的文件会保存为 `./cache/cached_pdf.pdf`。
+    - 缓存命中要求「来源 URL 与上次下载一致」（记录在 `./cache/cached_pdf.meta.json`）
+      且「文件不超过 1 小时」，避免多篇模式下后续论文误读第一篇的 PDF。
     """
     # 本地已存在的文件路径：直接返回，不下载（本地 PDF 入口的解耦点）。
     if pdf_file_path and not pdf_file_path.startswith("http") and os.path.isfile(pdf_file_path):
         return pdf_file_path
     if pdf_file_path.startswith("http"):
-        # 缓存检测：如果 cached_pdf.pdf 存在且不超过 1 小时，直接复用
+        # 缓存检测：缓存路径对所有论文是常量，只看文件新旧会让多篇模式的第 2 篇起
+        # 全部读到第 1 篇的 PDF，因此必须「同一来源 URL」+「不超过 1 小时」双条件成立
+        source_url = pdf_file_path
         cache_path = os.path.join("./cache", "cached_pdf.pdf")
-        if os.path.isfile(cache_path):
+        meta_path = _pdf_cache_meta_path(cache_path)
+        if os.path.isfile(cache_path) and _read_pdf_cache_url(meta_path) == source_url:
             import time as _time
             age = _time.time() - os.path.getmtime(cache_path)
             if age < 3600:
-                logging.info("复用缓存 PDF（%.0f 秒前下载）: %s", age, cache_path)
+                logging.info("复用缓存 PDF（%.0f 秒前下载，同一 URL）: %s", age, cache_path)
                 return cache_path
         logging.info("下载PDF文件")
         def download_file(url, max_retries=3):
@@ -486,7 +589,8 @@ def download_if_remote(pdf_file_path):
                     else:
                         logging.error(f"PDF 下载最终失败: {e}")
                         raise
-        pdf_file_path = download_file(pdf_file_path)
+        pdf_file_path = download_file(source_url)
+        _write_pdf_cache_url(meta_path, source_url)
         logging.info(f"下载完成，保存路径: {pdf_file_path}")
     # 检查文件是否存在
     if not os.path.isfile(pdf_file_path):
@@ -616,6 +720,8 @@ def generate_daily_arxiv_summary(query="cs.RO", date=datetime.datetime.now().str
 
     for paper_idx, paper in enumerate(papers):
         logging.info(f"处理第 {paper_idx + 1} 篇论文: {paper.title}")
+        # 每轮重置：word_budget 依赖本篇的图片数，沿用上一篇的值会按错误的图片数分配字数
+        word_budget = None
         if blog_url:
             # blog 模式: 跳过 PDF 下载 + PDFProcessor, 用 cache/paper_text.txt + ./pic/*.png
             logging.info("[blog-url] 跳过 PDF 流程, 从 cache 读取文本/图片")
@@ -662,8 +768,10 @@ def generate_daily_arxiv_summary(query="cs.RO", date=datetime.datetime.now().str
             image_agent = ImageAgent()
             # reuse extract_captions_from_pdf if available
             try:
-                contexts_dict = extract_captions_from_pdf(pdf_file_path) if (pdf_file_path and 'extract_captions_from_pdf' in globals()) else {}
-            except Exception:
+                # 导入失败时 extract_captions_from_pdf 是 None（名字仍在 globals 里），必须判可调用
+                contexts_dict = extract_captions_from_pdf(pdf_file_path) if (pdf_file_path and callable(extract_captions_from_pdf)) else {}
+            except Exception as e:
+                logging.warning("提取 PDF 题注失败，本篇图片将没有 caption: %s", e)
                 contexts_dict = {}
             contexts = {}
             for k, v in (contexts_dict or {}).items():
@@ -681,7 +789,8 @@ def generate_daily_arxiv_summary(query="cs.RO", date=datetime.datetime.now().str
                         cap = contexts.get(img_idx + 1, f"Figure {img_idx + 1}") if contexts else f"Figure {img_idx + 1}"
                         captions_for_rating.append(cap)
                     scores = rate_image_importance(captions_for_rating)
-                    images = select_top_images(images, scores, top_n=MAX_IMAGES_DEFAULT)
+                    images, contexts = _select_top_images_with_contexts(
+                        images, scores, contexts, top_n=MAX_IMAGES_DEFAULT)
                     logging.info(f"筛选后保留 {len(images)} 张图片")
                 except Exception as e:
                     logging.warning(f"图片筛选失败，使用前 {MAX_IMAGES_DEFAULT} 张: {e}")
@@ -724,8 +833,8 @@ def generate_daily_arxiv_summary(query="cs.RO", date=datetime.datetime.now().str
         
         # 生成简短摘要（注入字数预算）
         logging.info("生成摘要")
-        # word_budget 可能在 try 块外未定义（图像解释失败时），兜底计算
-        if 'word_budget' not in dir():
+        # word_budget 可能因图像解释 try 块提前失败而没算到（循环开头已重置为 None），兜底计算
+        if word_budget is None:
             word_budget = compute_word_budget(per_paper_duration, num_images=len(images))
         structured_plan_part = {}
         if long_or_short == "short":
@@ -836,8 +945,8 @@ def generate_daily_arxiv_summary(query="cs.RO", date=datetime.datetime.now().str
     if len(papers) == 1:
         part_video_path = generated_part_paths[0]
         date_str=datetime.datetime.now().strftime(r"%Y-%m-%d")
-        title_for_filename = cn_titles[0] if cn_titles else "daily_summary"
-        title_for_filename = re.sub(r'[\\/:*?"<>|]', '', title_for_filename).strip() or "daily_summary"
+        title_for_filename = sanitize_filename(
+            cn_titles[0] if cn_titles else "", "daily_summary")
         new_part_video_path = os.path.abspath(f"./output/{date_str}_{title_for_filename}.mp4")
         if skip_main_video:
             # manim-only 模式: part_video_path 是预定路径不存在, 跳过物理重命名, 仅返回字符串

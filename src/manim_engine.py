@@ -16,6 +16,7 @@ import re
 import subprocess
 import logging
 import glob
+import time
 import yaml
 import shutil
 
@@ -47,6 +48,13 @@ QUALITY_MAP = {
     "high": "-qh",      # 1080p
 }
 
+# opencode 子进程超时(秒)，与 js_anim_engine._OPENCODE_TIMEOUT 取同一量级
+# （代码生成可能很慢，但必须有上限，否则 opencode 挂住会无限阻塞整条流水线）。
+_OPENCODE_TIMEOUT = 86400
+
+# 判定「本次渲染产物」的 mtime 容差(秒)：文件系统时间戳精度 + 子进程启动抖动。
+_FRESH_OUTPUT_SLACK_SEC = 2
+
 # 布局常量
 TEXT_WRAP_THRESHOLD = 25      # 文本超过此字符数自动换行
 MAX_FRAME_WIDTH = 12          # 画框最大宽度（安全区域）
@@ -54,6 +62,72 @@ MAX_FRAME_HEIGHT = 7          # 画框最大高度
 SAFE_FRAME_WIDTH = 11         # 缩放目标宽度
 SAFE_FRAME_HEIGHT = 6.5       # 缩放目标高度
 
+
+
+def _find_stmt_end_line(lines, start):
+    """返回 lines[start] 起的括号语句结束行号(含)；到末尾仍未配平返回 None。
+
+    逐字符扫描并跳过字符串字面量与行注释，避免把 Text("(a)") 里的括号算进深度。
+    单行语句返回 start 本身。
+    """
+    depth = 0
+    quote = None
+    for idx in range(start, len(lines)):
+        line = lines[idx]
+        k = 0
+        while k < len(line):
+            ch = line[k]
+            if quote:
+                if ch == "\\":
+                    k += 2
+                    continue
+                if line.startswith(quote, k):
+                    k += len(quote)
+                    quote = None
+                    continue
+                k += 1
+                continue
+            if ch == "#":
+                break
+            if ch in ('"', "'"):
+                quote = ch * 3 if line.startswith(ch * 3, k) else ch
+                k += len(quote)
+                continue
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            k += 1
+        # 单/双引号字符串不跨行，只有三引号才继续带到下一行
+        if quote and len(quote) == 1:
+            quote = None
+        if depth <= 0:
+            return idx
+    return None
+
+
+def compress_blog_assignments(blog_assignments, rendered_indices):
+    """把 blog/示意外部视频的 scene_defs 下标压缩成 scene_videos 下标。
+
+    纯逻辑、无副作用，便于单测。narration_audios / scene_image_paths 都已按
+    rendered_indices 压缩对齐，blog_assignments 必须用同一套映射；否则任一
+    scene 渲染失败(或 PAPERIFY_METHOD_ONLY 跳过)后，compose 按 scene_videos
+    下标查就会取到别的 scene 的视频(成片张冠李戴)。
+
+    Args:
+        blog_assignments: dict[int, str] scene_defs 下标 -> 外部视频路径。
+        rendered_indices: list[int] 实际进了 scene_videos 的 scene_defs 下标。
+
+    Returns:
+        dict[int, str] scene_videos 下标 -> 外部视频路径。
+    """
+    if not blog_assignments:
+        return {}
+    return {
+        new_idx: blog_assignments[old_idx]
+        for new_idx, old_idx in enumerate(rendered_indices)
+        if old_idx in blog_assignments
+    }
 
 
 def apply_anim_render_results(scene_defs, narrations, blog_assignments,
@@ -112,6 +186,8 @@ class ManimEngine:
         self.structured_plan = structured_plan or {}
         self.output_dir = output_dir
         self.arxiv_id = arxiv_id
+        # 本次 run 的起点: 区分"上一篇论文/上一轮的残留产物"与本次刚渲好的产物
+        self._run_started_at = time.time()
         self.temp_dir = os.path.join(output_dir, "temp")
         os.makedirs(self.output_dir, exist_ok=True)
         # 清空旧的临时文件，避免残留影响新 pipeline
@@ -180,8 +256,15 @@ class ManimEngine:
         search_start = max(0, last_content_idx - 5)
         for i in range(last_content_idx, search_start - 1, -1):
             if 'FadeOut' in lines[i] and 'self.play' in lines[i]:
+                # self.play(...) 常被 LLM 写成跨行(run_time= 换到下一行)，只替换
+                # 起始行会留下孤立续行 `run_time=1.5)` -> SyntaxError。先按括号
+                # 配平找出整条语句的结束行整段替换；配不平就原样返回不冒险改坏。
+                end = _find_stmt_end_line(lines, i)
+                if end is None:
+                    logger.warning("末尾 FadeOut 语句括号未配平，跳过移除")
+                    return code
                 indent = len(lines[i]) - len(lines[i].lstrip())
-                lines[i] = ' ' * indent + 'self.wait(2)  # 保持内容显示'
+                lines[i:end + 1] = [' ' * indent + 'self.wait(2)  # 保持内容显示']
                 break
         return '\n'.join(lines)
 
@@ -458,7 +541,13 @@ class ManimEngine:
                 logger.warning("清理旧 %s 失败: %s", scene_py_path, _e)
 
         env = os.environ.copy()
-        env["DEEPSEEK_API_KEY"] = self._get_deepseek_key()
+        # 取到非空才覆盖：_get_config 读的是相对路径 config.yaml，cwd 不在项目根时
+        # 读空，无条件覆盖会把环境里原本有效的 key 抹成空串，opencode 直接认证失败。
+        deepseek_key = self._get_deepseek_key()
+        if deepseek_key:
+            env["DEEPSEEK_API_KEY"] = deepseek_key
+        else:
+            logger.warning("未取到 llm_api_key/LLM_API_KEY，沿用环境已有的 DEEPSEEK_API_KEY")
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = "0"
         env.pop("http_proxy", None)
@@ -482,7 +571,8 @@ class ManimEngine:
             # CWD_ISOLATION_PATCH: cwd 改到 temp_dir，避免 opencode 误读项目根 .py 产物
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True,
-                env=env, cwd=os.path.abspath(self.temp_dir)
+                env=env, cwd=os.path.abspath(self.temp_dir),
+                timeout=_OPENCODE_TIMEOUT,
             )
             logger.info(
                 "opencode subprocess: returncode=%s stdout_len=%d stderr_len=%d",
@@ -593,6 +683,9 @@ class ManimEngine:
     ARCH_MAX_ELEMENTS = 20
 
     def _trim_architecture_elements(self, figure_analysis, manim_ctx, eb_elements, n_total):
+        import os as _os
+        if _os.environ.get("JSR_DISABLE_TRIM")=="1":
+            return manim_ctx, eb_elements, n_total, n_total
         """架构图防重叠治本: 把注入给 opencode 的元素裁剪到核心 ARCH_MAX_ELEMENTS 个。
 
         通过裁剪结构化 analysis.components (按 bbox 面积降序保留主干大块),
@@ -701,7 +794,9 @@ class ManimEngine:
                 figure_analysis,
                 figure_analysis.get("manim_context", ""),
                 figure_analysis.get("eb_manim_elements", ""),
-                len(figure_analysis.get("analysis", {}).get("components", [])),
+                # analysis 可能是 None(figure_analyzer 失败路径返回 {"analysis": None})，
+                # key 存在时 get 的默认值不生效，必须用 or 兜住，否则 None.get 崩掉整条流水线
+                len(((figure_analysis or {}).get("analysis") or {}).get("components") or []),
             )
             if manim_ctx:
                 user_content += f"\n{manim_ctx}\n"
@@ -754,6 +849,42 @@ class ManimEngine:
     # 渲染
     # ------------------------------------------------------------------
 
+    def _purge_stale_scene_outputs(self, media_dir, scene_name, ext):
+        """渲染前清掉该 scene 上一次 run 留下的同名产物(partial_movie_files 不动)。
+
+        media_dir 与 scene 名都是固定的，上一篇论文的 <scene>.mp4 留在盘上，
+        本次渲染一炸就会被 glob 捡回来冒充成功。只删本 run 之前的：本 run 里刚渲好的
+        同名产物(一致性检查重渲的上一版)要留着，重渲失败时上层还要回退用它。
+        """
+        for f in glob.glob(os.path.join(media_dir, "**", f"{scene_name}.{ext}"), recursive=True):
+            if "partial_movie_files" in f:
+                continue
+            try:
+                # 同 _collect_fresh_outputs 留一点时钟容差: 内核落 mtime 的时钟
+                # 比 time.time() 粗, 刚写出的文件 mtime 可能略早于本 run 起点
+                if os.path.getmtime(f) >= self._run_started_at - _FRESH_OUTPUT_SLACK_SEC:
+                    continue
+                os.remove(f)
+                logger.info("清理 %s 的历史产物: %s", scene_name, f)
+            except OSError as _e:
+                logger.warning("清理历史产物失败 %s: %s", f, _e)
+
+    def _collect_fresh_outputs(self, pattern, started_at):
+        """按 glob pattern 找本次渲染(mtime 不早于 started_at)的产物，新的排前面。"""
+        out = []
+        for f in glob.glob(pattern, recursive=True):
+            if "partial_movie_files" in f:
+                continue
+            try:
+                mtime = os.path.getmtime(f)
+            except OSError:
+                continue
+            if mtime < started_at - _FRESH_OUTPUT_SLACK_SEC:
+                logger.info("忽略非本次渲染的残留文件: %s", f)
+                continue
+            out.append((mtime, f))
+        return [f for _m, f in sorted(out, reverse=True)]
+
     def render_scene(self, code, scene_name, quality="medium", fmt="mp4", max_retries=3):
         """渲染单个 Manim 场景。"""
         quality_flag = QUALITY_MAP.get(quality, "-qm")
@@ -767,26 +898,33 @@ class ManimEngine:
             cmd = f"manim render {quality_flag} {fmt_flag} --media_dir {self.output_dir}/media {script_path} {scene_name}"
             logger.info("渲染场景 %s (第 %d 次): %s", scene_name, attempt + 1, cmd)
 
+            # 先清历史同名产物 + 记起始时间，保证下面 found 到的是本次渲染的结果
+            ext = "gif" if fmt == "gif" else "mp4"
+            media_dir = os.path.join(self.output_dir, "media", "videos")
+            self._purge_stale_scene_outputs(media_dir, scene_name, ext)
+            started_at = time.time()
+
             try:
                 result = subprocess.run(
                     cmd, shell=True, capture_output=True, text=True, timeout=86400
                 )
 
-                ext = "gif" if fmt == "gif" else "mp4"
-                media_dir = os.path.join(self.output_dir, "media", "videos")
-                found = glob.glob(os.path.join(media_dir, "**", f"{scene_name}.{ext}"), recursive=True)
-                found = [f for f in found if "partial_movie_files" not in f]
-                if found:
-                    logger.info("场景 %s 渲染成功: %s", scene_name, found[0])
-                    return found[0]
-
+                # 只有 manim 自己报成功才去认产物：returncode != 0 一律走重试/失败路径，
+                # 绝不 glob 兜底(否则捡到残留旧文件当成功，retry 不触发、成片混别的论文)
                 if result.returncode == 0:
-                    all_files = glob.glob(os.path.join(self.output_dir, "**", f"*.{ext}"), recursive=True)
-                    all_files = [f for f in all_files if "partial_movie_files" not in f]
+                    found = self._collect_fresh_outputs(
+                        os.path.join(media_dir, "**", f"{scene_name}.{ext}"), started_at)
+                    if found:
+                        logger.info("场景 %s 渲染成功: %s", scene_name, found[0])
+                        return found[0]
+
+                    all_files = self._collect_fresh_outputs(
+                        os.path.join(self.output_dir, "**", f"*.{ext}"), started_at)
                     if all_files:
-                        latest = max(all_files, key=os.path.getmtime)
-                        logger.info("使用最新输出文件: %s", latest)
-                        return latest
+                        logger.info("使用最新输出文件: %s", all_files[0])
+                        return all_files[0]
+
+                    logger.warning("场景 %s: manim 返回 0 但没有本次的 %s 产物", scene_name, ext)
 
                 error_msg = result.stderr or result.stdout
                 logger.warning("场景 %s 渲染失败 (第 %d 次):\n%s", scene_name, attempt + 1, error_msg[:2000])
@@ -794,18 +932,20 @@ class ManimEngine:
                 if attempt < max_retries - 1:
                     fix_prompt = prompts_dict.get("manim_fix_code", "")
                     fix_content = f"原始代码:\n```python\n{code}\n```\n\n错误信息:\n```\n{error_msg[:3000]}\n```"
-                    code = self._opencode_generate_with_retry(fix_prompt + "\n\n" + fix_content, attempts=2, scene_name=scene_name)
-                    code = (code or "").strip()
-                    if code.startswith("```"):
-                        code = re.sub(r"^```\w*\n?", "", code)
-                        code = re.sub(r"\n?```$", "", code)
-                        code = code.strip()
-                    if code:
-                        # 修复代码同样要过安全网/重叠守卫等注入，否则重试版本会丢失全部保护
-                        code = self.inject_bounds_check(code)
-                        logger.info("opencode 已修复代码，准备重试")
-                    else:
-                        logger.warning("opencode 修复失败，无法重试")
+                    # 修复结果先收在临时变量：直接覆盖 code 的话，修复返回空就把原代码
+                    # 永久丢了，下一轮 attempt 会把空串写进 .py 再渲一次(必然失败还白烧一轮)
+                    fixed = self._opencode_generate_with_retry(fix_prompt + "\n\n" + fix_content, attempts=2, scene_name=scene_name)
+                    fixed = (fixed or "").strip()
+                    if fixed.startswith("```"):
+                        fixed = re.sub(r"^```\w*\n?", "", fixed)
+                        fixed = re.sub(r"\n?```$", "", fixed)
+                        fixed = fixed.strip()
+                    if not fixed:
+                        logger.warning("opencode 修复失败，保留原代码并终止重试")
+                        break
+                    # 修复代码同样要过安全网/重叠守卫等注入，否则重试版本会丢失全部保护
+                    code = self.inject_bounds_check(fixed)
+                    logger.info("opencode 已修复代码，准备重试")
 
             except subprocess.TimeoutExpired:
                 logger.error("场景 %s 渲染超时", scene_name)
@@ -819,6 +959,80 @@ class ManimEngine:
     # Pipeline 图片加载（caption-based matching）
     # ------------------------------------------------------------------
 
+    # *_script.json 新鲜度窗口(秒)：超过这个时长的一律当上一篇论文的残留丢弃。
+    SCRIPT_JSON_MAX_AGE = 6 * 3600
+
+    def _current_run_marker_mtime(self):
+        """本次 pipeline 的时间基准：每轮开头被 _clean_pipeline_cache 清掉重写的 cache 文件 mtime。
+
+        这些文件只属于本次论文，本次的 *_script.json 一定写在它们之后；都不存在返回 None。
+        """
+        newest = None
+        for p in ("./cache/paper_text.txt", "./cache/structured_plan.json",
+                  "./cache/image_explanations.json"):
+            if not os.path.exists(p):
+                continue
+            ts = os.path.getmtime(p)
+            newest = ts if newest is None else max(newest, ts)
+        return newest
+
+    def _load_current_script_json(self, explanations):
+        """加载本次论文的 *_script.json；判不出属于本次就返回 None(宁可不覆盖 caption)。
+
+        ./output 与 ./src/output 下堆着十来个跨月份的历史 json，原先 glob 到谁用谁，
+        命中别的论文就用错 caption 把配图分错桶。这里两道判据都过了才采用：
+          1. 新鲜度：mtime 不早于本次 pipeline 写的 cache 标记，且不超过 SCRIPT_JSON_MAX_AGE;
+          2. 身份：本次 image_explanations 非空时，caption 必须对得上(同一批图)。
+
+        Args:
+            explanations: 本次 ./cache/image_explanations.json 的内容(list)，可为空。
+
+        Returns:
+            dict | None: 本次论文的 script.json 内容。
+        """
+        candidates = (glob.glob("./src/output/*_script.json")
+                      + glob.glob("./output/*_script.json"))
+        if not candidates:
+            return None
+
+        marker = self._current_run_marker_mtime()
+        now = time.time()
+        expl_captions = {
+            (e.get("caption") or "").strip()
+            for e in (explanations or [])
+            if isinstance(e, dict) and (e.get("caption") or "").strip()
+        }
+
+        # mtime 新的优先：一次 pipeline 里最多只有一份属于本次
+        for path in sorted(candidates, key=os.path.getmtime, reverse=True):
+            mtime = os.path.getmtime(path)
+            if marker is not None and mtime < marker:
+                logger.info("跳过历史 script.json(早于本次 pipeline 缓存): %s", path)
+                continue
+            if now - mtime > self.SCRIPT_JSON_MAX_AGE:
+                logger.info("跳过过期 script.json(%.1f 小时前): %s", (now - mtime) / 3600.0, path)
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception as _e:
+                logger.warning("读取 %s 失败: %s", path, _e)
+                continue
+            if expl_captions:
+                json_captions = {
+                    (img.get("caption") or "").strip()
+                    for img in (data.get("images") or [])
+                    if isinstance(img, dict)
+                }
+                if not (expl_captions & json_captions):
+                    logger.warning("script.json 的 caption 与本次论文对不上，不采用: %s", path)
+                    continue
+            logger.info("采用本次论文的 script.json: %s", path)
+            return data
+
+        logger.info("没有属于本次论文的 script.json，保留 image_explanations 的 caption")
+        return None
+
     def load_pipeline_images(self):
         """从 pipeline 的 script.json 和 image_explanations 加载图片，按场景类型分配。"""
         pic_files = sorted(glob.glob("./pic/*.png"),
@@ -828,18 +1042,11 @@ class ManimEngine:
         if not pic_files:
             return {"opening": [], "intro": [], "method": [], "results": []}
 
-        # 1. 优先从 script.json 读取（有最准确的 context/transition 信息）
-        script_json = None
-        for f in glob.glob("./src/output/*_script.json") + glob.glob("./output/*_script.json"):
-            try:
-                with open(f, "r", encoding="utf-8") as fh:
-                    script_json = json.load(fh)
-                break
-            except Exception:
-                continue
-
-        # 2. 或从 image_explanations.json 读取
+        # 1. 先读本次 pipeline 的 image_explanations.json（每轮开头被
+        #    _clean_pipeline_cache 清掉重写，一定属于本次论文），它同时是判定
+        #    script.json 归属的身份依据。
         captions = {}
+        explanations = []
         expl_path = "./cache/image_explanations.json"
         if os.path.exists(expl_path):
             with open(expl_path, "r", encoding="utf-8") as f:
@@ -852,6 +1059,9 @@ class ManimEngine:
                         "role": expl.get("figure_role", ""),
                         "section": expl.get("recommended_section", "method"),
                     }
+
+        # 2. script.json 的 caption/context 更准，但必须是「本次论文」那一份
+        script_json = self._load_current_script_json(explanations)
 
         # 如果有 script.json，用它的 images 字段更新 captions
         if script_json and "images" in script_json:
@@ -951,6 +1161,11 @@ class ManimEngine:
                 else:
                     audio_parts.append(None)  # 合成失败也占位，保持对齐
 
+            # 各 scene 的音频路径（None = 该 scene 无音轨），与 scene_videos 等长。
+            # 必须在下面的拼接/写盘之前赋值：那两步任一抛异常都会被外层 except 吞掉，
+            # 赋值留在后面就会让 compose 拿到 []，全片静音（而分段 mp3 其实都在盘上）。
+            self._audio_parts = audio_parts
+
             # 至少要有一段真实音频，否则没有可拼接的音轨
             real_parts = [p for p in audio_parts if p]
             if not real_parts:
@@ -965,12 +1180,13 @@ class ManimEngine:
             for clip in audio_clips:
                 clip.close()
 
-            # 各 scene 的音频路径（None = 该 scene 无音轨），与 scene_videos 等长
-            self._audio_parts = audio_parts
             return output_audio
 
         except Exception as e:
-            logger.warning("TTS 生成失败: %s", e)
+            # 合成/写盘炸了不代表分段 mp3 没生成：_audio_parts 已在上面赋值，
+            # compose 仍按 scene 逐段配音，不会整片静音。
+            logger.warning("TTS 合成失败（已保留 %d 段分段音频）: %s",
+                           len(getattr(self, "_audio_parts", []) or []), e, exc_info=True)
             return None
 
     # ------------------------------------------------------------------
@@ -1526,14 +1742,54 @@ class ManimEngine:
             pipeline_images, scene_defs, rendered_indices
         )
 
+        # blog/示意 scene 的外部视频也要按 rendered_indices 压缩：它的 key 是
+        # scene_defs 下标，compose 却按压缩后的 scene_videos 下标查，
+        # 任一 scene 渲染失败（或 PAPERIFY_METHOD_ONLY 跳过）就会错位。
+        composed_blog_videos = compress_blog_assignments(
+            self._blog_scene_assignments, rendered_indices)
+
         output = self.compose(
             scene_videos,
             fmt=fmt,
             scene_image_paths=scene_image_paths,
             narration_audios=audio_paths,
-            blog_scene_videos=self._blog_scene_assignments or None,
+            blog_scene_videos=composed_blog_videos or None,
         )
 
         if output:
             logger.info("=== Manim 演示生成完成: %s ===", output)
+            # 落盘最终旁白段落 + 各 scene 尾帧(动画完成态, 含公式/论文图合成画面),
+            # 供小红书图文卡片等下游复用。segments[i] 与 scene_videos[i] 一一对应。
+            try:
+                import subprocess as _sp
+                final_narrations = [narrations[i] for i in rendered_indices]
+                frames_dir = os.path.join(self.output_dir, "scene_frames")
+                os.makedirs(frames_dir, exist_ok=True)
+                segments = []
+                for _i, (_narr, _vid) in enumerate(zip(final_narrations, scene_videos)):
+                    frame_path = os.path.abspath(
+                        os.path.join(frames_dir, f"scene_{_i:02d}.png"))
+                    frame_ok = False
+                    try:
+                        _r = _sp.run(
+                            ["ffmpeg", "-y", "-sseof", "-0.5", "-i", _vid,
+                             "-update", "1", "-q:v", "2", frame_path],
+                            capture_output=True, timeout=60)
+                        frame_ok = (_r.returncode == 0
+                                    and os.path.exists(frame_path)
+                                    and os.path.getsize(frame_path) > 0)
+                    except Exception as _fe:  # noqa: BLE001
+                        logger.warning("[narration] scene %d 抽帧失败: %s", _i, _fe)
+                    segments.append({
+                        "text": _narr,
+                        "frame": frame_path if frame_ok else None,
+                    })
+                narration_path = os.path.join(self.output_dir, "narration_segments.json")
+                with open(narration_path, "w", encoding="utf-8") as _nf:
+                    json.dump({"segments": segments}, _nf, ensure_ascii=False, indent=2)
+                logger.info("[narration] 旁白+scene帧已保存: %s (%d 段, %d 帧)",
+                            narration_path, len(segments),
+                            sum(1 for x in segments if x["frame"]))
+            except Exception as _ne:  # noqa: BLE001
+                logger.warning("[narration] 旁白段落保存失败: %s", _ne)
         return output
