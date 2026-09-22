@@ -413,18 +413,39 @@ if __name__ == "__main__":
         else:
             video_tags = "具身智能,VLA,机器人,AI论文,大模型,前沿科技,arXiv"
         video_desc = "\n".join(titles)
+        # manim 渲染成功时落盘的最终旁白段落+scene帧(供 meta 与小红书图文卡片复用)
+        narration_segments = None
+        scene_frames = None
+        _narr_path = "./output/manim/narration_segments.json"
+        if os.path.exists(_narr_path):
+            try:
+                with open(_narr_path, "r", encoding="utf-8") as _nf:
+                    _narr_data = json.load(_nf)
+                if isinstance(_narr_data, dict) and "segments" in _narr_data:
+                    _segs = _narr_data["segments"]
+                    narration_segments = [x.get("text") or "" for x in _segs]
+                    scene_frames = [x.get("frame") for x in _segs]
+                elif isinstance(_narr_data, list):  # 旧格式兼容
+                    narration_segments = _narr_data
+            except Exception as _narr_e:  # noqa: BLE001
+                logging.warning("旁白段落读取失败: %s", _narr_e)
         try:
             base_mp4 = os.path.splitext(path)[0]
             with open(base_mp4 + "_meta.json", "w", encoding="utf-8") as _mf:
                 import json as _j
-                _j.dump({
+                _meta_obj = {
                     "path": path,
                     "titles": titles,
                     "cn_titles": cn_titles,
                     "summaries": summaries,
                     "paper_links": paper_links,
                     "project_links": project_links,
-                }, _mf, ensure_ascii=False, indent=2)
+                }
+                if narration_segments:
+                    _meta_obj["narration_segments"] = narration_segments
+                if scene_frames:
+                    _meta_obj["scene_frames"] = scene_frames
+                _j.dump(_meta_obj, _mf, ensure_ascii=False, indent=2)
             logging.info("meta saved: %s", base_mp4 + "_meta.json")
         except Exception as _e:
             logging.warning("meta save failed: %s", _e)
@@ -443,6 +464,8 @@ if __name__ == "__main__":
                 project_links=project_links,
                 bilibili_tid=188,
                 tags_per_platform=tags_per_platform,
+                narration_segments=narration_segments,
+                scene_frames=scene_frames,
             )
             logging.info("上传结果汇总: %s", upload_results)
         else:

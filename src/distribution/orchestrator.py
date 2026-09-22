@@ -132,7 +132,10 @@ def _build_compact_description(
     total_limit: int,
     summary_limit: int,
     include_cn_titles: bool = False,
-    include_links: bool = True,
+    # 默认 False 是 fail-safe: 外链会触发平台限流(2026-05-29 B站简介带链接被限流),
+    # 新增平台的 builder 漏传这个参数时应当"不带链接", 而不是默默把链接发出去。
+    # 要链接的调用方显式传 include_links=True。
+    include_links: bool = False,
 ) -> str:
     lines: List[str] = []
     num_papers = max(
@@ -253,6 +256,8 @@ def upload_generated_content(
     bilibili_tid: int = 188,
     xhs_tags: Optional[List[str]] = None,
     tags_per_platform: Optional[Dict[str, List[str]]] = None,
+    narration_segments: Optional[List[str]] = None,
+    scene_frames: Optional[List[Optional[str]]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
     Upload generated assets to selected platforms.
@@ -260,6 +265,17 @@ def upload_generated_content(
     Returns a per-platform result summary without raising on single-platform failures.
     """
     results: Dict[str, Dict[str, object]] = {}
+
+    # 上传出口最后一道防线: 剥离标题非法可见符号(尖括号/残缺书名号/控制字符),
+    # 防 LLM 生成的坏标题触发 B站 21009 拒稿(历史坑, 见 tests/test_title_cleaner.py)。
+    try:
+        from src.utils.title_cleaner import strip_platform_illegal_chars as _strip_illegal
+        if video_title:
+            video_title = _strip_illegal(video_title) or video_title
+        if cn_titles:
+            cn_titles = [(_strip_illegal(t) or t) if t else t for t in cn_titles]
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("标题非法符号剥离失败, 用原标题: %s", _e)
 
     if "bilibili" in platforms:
         try:
@@ -315,31 +331,30 @@ def upload_generated_content(
         else:
             final_tags = list(XHS_FALLBACK_TAGS)
 
-        # 优先尝试视频上传，失败则降级为图文上传
-        video_uploaded = False
-        if video_path and os.path.exists(video_path):
+        # 小红书只发图文卡片(标题/旁白文字渲染进图), 不再上传视频。
+        # publish_video 保留在 xiaohongshu.py 以兼容旧调用方, 此处不再路由。
+        if True:
             try:
-                publish_result = upload_xiaohongshu_video(
-                    title=xhs_title,
-                    content=xhs_content,
-                    video_path=video_path,
-                    cover_path=cover_path,
-                    tags=final_tags,
-                )
-                if publish_result:
-                    note_id = publish_result.get("note_id") if isinstance(publish_result, dict) else None
-                    results["xiaohongshu"] = {"ok": True, "id": note_id, "type": "video"}
-                    video_uploaded = True
-                else:
-                    logger.warning("小红书视频上传返回空结果，降级为图文上传")
-            except Exception as exc:
-                logger.warning("小红书视频上传失败，降级为图文上传: %s", exc)
+                images: List[str] = []
+                try:
+                    from .xhs_cards import render_note_cards
+                    paper_imgs = sorted(glob.glob("./pic/*.png"))[:2]
+                    card_title = cn_titles[0] if cn_titles else xhs_title
+                    images = render_note_cards(
+                        title=card_title,
+                        narration_segments=narration_segments,
+                        summaries=summaries,
+                        cover_path=cover_path,
+                        paper_images=paper_imgs,
+                        scene_frames=scene_frames,
+                    )
+                except Exception as card_exc:  # noqa: BLE001
+                    logger.warning("小红书图文卡片渲染失败, 降级封面+论文图: %s", card_exc)
 
-        if not video_uploaded:
-            try:
-                images = _collect_xhs_images(cover_path)
                 if not images:
-                    raise FileNotFoundError("小红书上传缺少可用图片（封面与 ./pic/*.png 均不存在）")
+                    images = _collect_xhs_images(cover_path)
+                if not images:
+                    raise FileNotFoundError("小红书上传缺少可用图片（卡片渲染失败且封面与 ./pic/*.png 均不存在）")
 
                 publish_result = upload_xiaohongshu_note(
                     title=xhs_title,
