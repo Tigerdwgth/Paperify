@@ -74,8 +74,26 @@ services:
     build: *common-build
     container_name: jushenrenji-chromium-daemon
     command: ["chromium-daemon"]
-    environment: *common-env
-    volumes: *common-volumes
+    # 抖音/小红书/B 站都是国内站点, chromium 不该走 clash proxy
+    # (走 proxy 会因 clash mode 不识别国内域 ERR_PROXY_CONNECTION_FAILED).
+    # 单独 override common-env 里的 HTTPS_PROXY 等为空.
+    environment:
+      <<: *common-env
+      HTTPS_PROXY: ""
+      HTTP_PROXY: ""
+      https_proxy: ""
+      http_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    # chromium-daemon 单独挂 src ro, 让 stealth / human_loop patch 即时生效
+    # (paper-video service 不挂 src, 用 image 内 truth)
+    volumes:
+      - ./cache:/app/cache
+      - ./output:/app/output
+      - ./data:/app/data
+      - ./pic:/app/pic
+      - ./config.yaml:/app/config.yaml:ro
+      - ./src:/app/src:ro
     shm_size: "2gb"
     restart: unless-stopped
     healthcheck:

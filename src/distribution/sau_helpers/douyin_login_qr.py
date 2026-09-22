@@ -116,15 +116,9 @@ async def _login(args) -> dict:
                 return {"ok": True, "url": page.url,
                         "cookie": str(cookie_target)}
 
-            try:
-                expired = page.get_by_text("二维码失效", exact=True).first
-                if await expired.count() and await expired.is_visible():
-                    logger.info("二维码失效, 点击刷新")
-                    await expired.click()
-                    last_src = ""
-            except Exception:
-                pass
-
+            # 自动刷新逻辑暂时禁用: 抖音登录页存在隐藏的"二维码失效"文本
+            # 节点导致每轮误触发刷新, 用户来不及扫码. 二维码 90s 自然失效后,
+            # 用户自行重跑脚本即可.
             await asyncio.sleep(poll_interval)
 
         return {"ok": False, "error": "扫码超时"}

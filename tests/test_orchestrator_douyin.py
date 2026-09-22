@@ -114,3 +114,50 @@ def test_douyin_exception_caught():
             assert "cookie" in r["douyin"]["error"]
     finally:
         os.unlink(video)
+
+
+def test_upload_strips_illegal_title_chars_bilibili():
+    """出口最后一道防线: video_title 带非法尖括号 → 传给 B站前被剥(B站 21009 修复)。"""
+    import os as _os
+    video = _make_video_file()
+    try:
+        with patch("src.distribution.orchestrator.upload_bilibili",
+                   return_value="BVFAKE") as mock_bili:
+            from src.distribution.orchestrator import upload_generated_content
+            upload_generated_content(
+                platforms=["bilibili"],
+                video_path=video, cover_path=None,
+                video_title="<Ba-TAB: 用翻译桥接人类到机器人技能",
+                video_tags="机器人,VLA",
+                video_desc="desc",
+                cn_titles=["<Ba-TAB: 用翻译桥接人类到机器人技能"],
+                origin_titles=["Translation as a Bridging Action"],
+            )
+            title = mock_bili.call_args.kwargs["title"]
+            assert title == "Ba-TAB: 用翻译桥接人类到机器人技能", title
+            assert "<" not in title and ">" not in title
+    finally:
+        _os.unlink(video)
+
+
+def test_upload_strips_illegal_title_chars_douyin():
+    """douyin 分支同样受出口清洗保护。"""
+    import os as _os
+    video = _make_video_file()
+    try:
+        with patch("src.distribution.orchestrator._upload_douyin_impl",
+                   return_value="douyin") as mock_dy:
+            from src.distribution.orchestrator import upload_generated_content
+            upload_generated_content(
+                platforms=["douyin"],
+                video_path=video, cover_path=None,
+                video_title="<BESTRO: 多人博弈>",
+                video_tags="a,b,c,d,e",
+                video_desc="desc",
+                tags_per_platform={"douyin": ["AI", "机器人"]},
+            )
+            title = mock_dy.call_args.kwargs["title"]
+            assert "<" not in title and ">" not in title
+            assert "BESTRO" in title
+    finally:
+        _os.unlink(video)

@@ -160,6 +160,7 @@ python -m src.distribution.xiaohongshu --login
 - Do not invent project links from organization, dataset, or demo homepages
 - Do not regenerate the full video when the task is only “补发 B站”
 - Do not forget that Monday's query date is the previous Friday
+- **Never batch republish without first verifying per-paper × per-platform last status.** Before any backfill or retry (especially right after fixing an underlying bug like an xhs-mcp image upgrade, douyin cookie reset, or bilibili cookie refresh), grep historic upload logs (`output/*_run*.log`, `output/*_upload*.log`, `output/*_retry*.log`, `tmp/*publish*.log`) and skip the (paper, platform) pairs that already returned `ok=True` / a valid `BVxxx`. Only enqueue the actual failures (`ok=False`, "发布返回空结果", `HTTP 请求失败`). Xiaohongshu and Bilibili do not dedupe server-side, so blind republish creates duplicate notes that pollute the account.
 
 ## Fast Checklist
 

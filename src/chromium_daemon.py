@@ -74,6 +74,30 @@ def _ensure_xvfb(display: str = ":99") -> None:
     time.sleep(2)
 
 
+_SAU_STEALTH_JS_PATH = "/app/third_party/social-auto-upload/utils/stealth.min.js"
+
+def _load_stealth_js() -> str:
+    """优先读 SAU stealth.min.js (180KB 业界标杆), 找不到时退化手写 fallback."""
+    try:
+        with open(_SAU_STEALTH_JS_PATH, "r", encoding="utf-8") as _sf:
+            return _sf.read()
+    except OSError:
+        return """(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = window.chrome || { runtime: {}, app: {} };
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }]
+    });
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+  } catch (e) {}
+})();"""
+
+
+_DOUYIN_LOGIN_COOKIES = ("sessionid_ss", "sessionid", "sid_guard")
+
+
+
 class ChromiumDaemon:
     def __init__(
         self,
@@ -97,6 +121,12 @@ class ChromiumDaemon:
         launch_args = [
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+            "--window-size=1920,1080",
             f"--remote-debugging-port={self.cdp_port}",
             "--remote-debugging-address=0.0.0.0",
         ]
@@ -110,6 +140,14 @@ class ChromiumDaemon:
             self._context = await self._browser.new_context(
                 storage_state=str(self.cookie_path),
                 permissions=["geolocation"],
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/145.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
             )
             self.status = "ready"
         else:
@@ -117,11 +155,25 @@ class ChromiumDaemon:
                            self.cookie_path)
             self._context = await self._browser.new_context(
                 permissions=["geolocation"],
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/145.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
             )
             self.status = "logged_out"
+        # stealth init script: 覆盖 webdriver / chrome.runtime / permissions /
+        # plugins / languages, 让抖音的 navigator.webdriver === undefined detection 失效
+        await self._context.add_init_script(_load_stealth_js())
         self._page = await self._context.new_page()
         await self._page.goto(self.home_url, wait_until="domcontentloaded",
                               timeout=30000)
+        # 启动鼠标轨迹模拟 background task (人类行为, 让抖音不主动 expire QR)
+        self._human_task = asyncio.create_task(self._human_loop())
+        self._autosave_task = asyncio.create_task(self._autosave_cookie())
         READY_FLAG.parent.mkdir(parents=True, exist_ok=True)
         READY_FLAG.write_text(json.dumps({
             "status": self.status,
@@ -160,6 +212,62 @@ class ChromiumDaemon:
         if self._page is None:
             return ""
         return self._page.url
+
+    async def _human_loop(self) -> None:
+        """背景模拟鼠标轨迹 + 偶尔滚轮: 让抖音 anti-bot 不强制 expire QR.
+
+        每 2-6 秒随机鼠标移动 (steps=15-40 让 chromium 真的发送 mouse events,
+        而非瞬移); 20% 概率轻微滚轮. 异常静默, 不影响主 daemon.
+        """
+        import random
+        # 让 page 真的 navigate 完再开始, 避免 race
+        await asyncio.sleep(3)
+        while not self._stop.is_set():
+            try:
+                page = self._page
+                if page is None:
+                    await asyncio.sleep(2)
+                    continue
+                x = random.randint(200, 1700)
+                y = random.randint(200, 900)
+                steps = random.randint(15, 40)
+                await page.mouse.move(x, y, steps=steps)
+                if random.random() < 0.2:
+                    dy = random.randint(-150, 150)
+                    await page.mouse.wheel(0, dy)
+            except Exception as exc:
+                logger.debug("human_loop iter exc (ignored): %s", exc)
+            await asyncio.sleep(random.uniform(2.0, 6.0))
+
+    async def _autosave_cookie(self) -> None:
+        """每 5 秒检查 context cookies, 发现抖音登录关键 cookie 立刻 storage_state.
+
+        实现 "daemon 持有扫码 session" 模式: 用户扫码后 daemon 自动捕获 cookie 写到
+        douyin_cookies.json, 切 status=ready. 后续 SAU upload attach daemon 直接用同
+        一 session (cookie 不丢, 不需要 reload-cookie).
+        """
+        await asyncio.sleep(8)  # 等 page 第一次 nav 完
+        saved = False
+        while not self._stop.is_set():
+            try:
+                if self._context is None or saved:
+                    await asyncio.sleep(5)
+                    continue
+                cookies = await self._context.cookies()
+                names = {c.get("name") for c in cookies}
+                hit = [n for n in _DOUYIN_LOGIN_COOKIES if n in names]
+                if hit:
+                    self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                    await self._context.storage_state(path=str(self.cookie_path))
+                    logger.info(
+                        "[autosave] 检测到登录 cookie %s, 已写到 %s",
+                        hit, self.cookie_path,
+                    )
+                    self.status = "ready"
+                    saved = True
+            except Exception as exc:
+                logger.debug("[autosave] iter exc (ignored): %s", exc)
+            await asyncio.sleep(5)
 
     async def stop(self) -> None:
         logger.info("daemon shutting down, 保存 cookie 到 %s", self.cookie_path)
