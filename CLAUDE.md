@@ -53,9 +53,12 @@ src/
 │   ├── llm_agent.py       # LLM 客户端 (qwen/deepseek)；`create_chat_completion()`
 │   └── prompts.py         # 提示词字典，key 为函数名（如 generate_summary）
 ├── distribution/
-│   ├── bilibili.py        # 视频上传（使用 cookies）
-│   ├── douyin.py
-│   └── rednote.py
+│   ├── orchestrator.py    # 多平台上传编排；upload_generated_content()
+│   ├── bilibili.py        # B站视频上传（使用 cookies）
+│   ├── douyin.py          # 抖音上传（chromium daemon / SAU）
+│   ├── xiaohongshu.py     # 小红书发布
+│   ├── xhs_cards.py       # 小红书图文卡片渲染
+│   └── f2_client.py       # 抖音数据读取客户端
 ├── video_creator.py       # 旧版视频创建（可能已弃用）
 ├── config.py              # 加载 config.yaml；导出 CACHE_DIR、FONT_PATH 等
 └── utils/
@@ -69,7 +72,7 @@ src/
 4. `ImageAgent` (Qwen-VL) 解释图片；结果缓存到 `./cache/image_explanations.json`
 5. `llm_agent` 调用 LLM 生成摘要和标题
 6. `VideoCreator` 合并图片 + DashScope TTS 音频 → moviepy 视频
-7. `auto_upload_bilibili` 上传最终视频
+7. `distribution/orchestrator.upload_generated_content()` 分发到 B站/小红书/抖音
 
 ## 关键模式
 
@@ -104,9 +107,15 @@ src/
 
 ## 重要说明
 
-- **没有自动化测试** - 修改后用 `python src/main.py --filename "/path/to/sample.pdf"` 本地验证
+- **自动化测试** - `python -m pytest tests/` 跑全量单测（约 50 秒跑完）。端到端验证仍用 `python src/main.py --filename "/path/to/sample.pdf"`
+- **测试默认碰不到真实出口**（`tests/conftest.py` 的 autouse 防线）：非 localhost 的网络请求、B站/小红书/抖音的真实上传实现、小红书卡片的 chromium 渲染，一律被换成抛 `BlockedRealCall` 的桩。历史原因见 LESSONS（实现改了调用路由后，老测试 mock 的函数不在路径上了，于是真的往线上发了笔记）。写新测试时如果撞上 `BlockedRealCall`，**默认答案是把那个调用 mock 掉**，而不是加 marker 放行。确实要打真实链路才用：
+  | marker | 放行什么 | 默认行为 |
+  |---|---|---|
+  | `smoke` | 全部（网络 + 发布 + 浏览器） | 默认 skip，`-m smoke` 才跑 |
+  | `allow_network` | 真实外网出口 | 照常执行 |
+  | `allow_publish` | 真实发布/上传实现 | 照常执行 |
+  | `allow_browser` | 真实 chromium 渲染 | 照常执行 |
 - `config.yaml` 中的 API 密钥应移至环境变量（共享仓库时）
-- `src/prompts.py` 和 `src/llm_tools/prompts.py` 同时存在（遗留 vs 新位置）
 
 
 

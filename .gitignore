@@ -61,3 +61,15 @@ data/creator_stats.db-journal
 data/creator_stats.db-shm
 data/creator_stats.db-wal
 docker/opencode/
+
+# 自动 backup 文件(带时间戳后缀, 如 .bak_1778472758)
+*.bak_*
+
+# 实验数据备份 / resnet 中间产物(非代码)
+cache_blog_v2_backup/
+pic_blog_v2_backup/
+src/cache_resnet/
+src/pic_resnet/
+
+# skills 锁文件含本机绝对路径, 对他人无意义
+skills-lock.json

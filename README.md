@@ -41,8 +41,8 @@
 2. **视频创建**：Ken Burns 动画 + 淡入淡出转场 + 半透明字幕，支持目标时长控制。
 3. **图文语义匹配**：基于 structured_plan 和 image_explanations 中的 recommended_section 字段，将摘要句子按语义匹配到对应图片，章节标题使用真实的 figure_role。
 4. **LLM脚本生成**：5段式结构化视频脚本（opening→intro→method→results），课堂讲解风格。
-5. **多平台上传**：B站视频上传 + 小红书视频/图文自动上传（视频优先，降级图文）。
-6. **TTS并发合成**：DashScope cosyvoice-v1，6线程并发加速。
+5. **多平台上传**：B站 / 抖音视频上传 + 小红书图文卡片发布（标题与旁白渲染进图，不再上传视频）。
+6. **TTS并发合成**：默认 DashScope cosyvoice-v2，可路由到 Qwen3-TTS / MiniMax Speech-2.8-HD 后端（`JSR_TTS_MODEL` / `JSR_TTS_VOICE` 覆盖），多线程并发加速。
 7. **图片智能筛选**：LLM 打分选取最重要的图片，Qwen-VL 生成图片讲解。
 8. **Demo 视频下载**：自动从论文项目主页提取并下载演示视频，嵌入最终视频开头。
 9. **网页视频转发**：从研究网页提取顶部主视频、封面和页面摘要，直接转发到 B站 与 小红书。
@@ -59,7 +59,7 @@
     - 有精确 bbox 时，manim_context 仅输出语义（避免与精确坐标冲突）
 12. **--paper-link 精准入口**：传入 arxiv URL 直接获取论文元数据，跳过关键词搜索和日期过滤。
 13. **--pdf 本地 PDF 入口**：传入本地 PDF 文件路径，解耦"获取 PDF"与"处理 PDF"，直接复用标准 PDF 处理链（文本/图片提取、图像解释、Manim 公式/示意动画）出讲解视频。适用于非 arxiv、离线或已下载的 PDF。无 arxiv id 时公式自动走 LLM 兜底、figure 走视觉分析。`arxiv_id = "local-" + md5(abspath(pdf))[:8]`。与 `--paper-link / --filename / --discover / --blog-url` 五选一互斥。
-13. **arxiv LaTeX 源码直读** (v3.2)：给定 arxiv_id 时优先从 arxiv e-print tarball 提取 TikZ/矢量图元做结构化分析。
+14. **arxiv LaTeX 源码直读** (v3.2)：给定 arxiv_id 时优先从 arxiv e-print tarball 提取 TikZ/矢量图元做结构化分析。
     - 模块 `src/arxiv_source_analyzer.py`：对外唯一入口 `try_structured_figure(arxiv_id, image_path, cache_root, paper_context)`
     - 路径 A（TikZ）：展开 `\input/\include` + 用户宏 → 抽 `\begin{figure}` → `parse_tikz_structure` 解析 `\node`/`\draw`
     - 路径 B（raster PDF）：tarball 已含 `.pdf` 图时，`pymupdf.get_drawings()` 抽矢量对象
@@ -69,22 +69,22 @@
     - Kill switch：设 `JSR_DISABLE_LATEX_SOURCE=1` 即回退到 SAM3+VL 路径
     - 依赖：`pylatexenc`（>=2.10）、`pymupdf`、系统 `pdflatex`（可选，仅路径 C 需要）
     - 透传入口：`ManimEngine(paper_text, structured_plan, arxiv_id=...)` 或在 `main.py --paper-link` 分支自动透传
-14. **三平台关键词动态生成**：每篇论文 LLM 一次产出 B站 / 小红书 / 抖音三平台关键词 dict（不再写死），三层兜底：prompt 约束 + 字符过滤 + 数量上限。
-15. **抖音上传集成**：基于 [`dreammis/social-auto-upload`](https://github.com/dreammis/social-auto-upload) Playwright 路线，子进程跨 venv 调用，含首次扫码登录的容器内二维码暴露流程 + 短信验证码弹窗自动 fill 入口。
-16. **三平台评论自动回复**：B站走 `bilibili-api-python` 官方 API、小红书走 `xhs` 库（SAU venv 子进程）、抖音读路径走 [`Johnserf-Seed/f2`](https://github.com/Johnserf-Seed/f2) mobile API（cookie 月级稳定，跟 PC 创作者中心风控通道隔离）+ 写路径走 chromium daemon CDP。LLM 活泼互动人设统一回复，sqlite 去重 + 日上限节流（B站 50/小红书 15/抖音 20）。
-17. **创作者中心数据聚合**：B站直接 API；小红书/抖音 mobile API（f2）；sqlite 存储 + ASCII summary 表 + CLI 子命令 (`fetch` / `summary`)；可选飞书多维表格上报（stub，需配置 lark 凭证）。
-18. **Manim-only 模式**：`--manim` 时跳过 main video 渲染（节省 60-95 分钟），仅生成 manim 视频作为最终输出。`paperagent_workflow.generate_daily_arxiv_summary(skip_main_video=True)` 控制；`structured_plan` + `paper_text` 同步缓存到 `cache/` 供后续 manim 阶段读取。
-19. **Manim 累加显示 + 文字重叠守卫**：单屏 5 个元素以内禁止中途 FadeOut，元素累加 FadeIn 直至本场景结束统一一次 FadeOut；`_ensure_page_fadeouts` 已禁用避免 post-process 强插中间 FadeOut。`_inject_text_overlap_guard` 运行时包裹 `self.play`，每次播放后按包围盒检测文字 mobject 重叠（交叠面积 / **较大块面积** > 0.5，要求两块大幅互相重合才判定为糊成一团），只保留最上层（最新/ z_index 最高）文字，把被遮挡的下层文字 FadeOut —— 即"新文字出现后只显示最上层的文字"，不重叠的文字仍累加保留。文字类型用 `isinstance` 识别（覆盖 Title 等子类）；阈值用较大块面积归一化，避免小标签压在大段落角落时误删整段。
-20. **opencode 全文上下文**：取消论文文本截取（之前 `[:2000]` / `[:1500]`），DeepSeek-V4-Pro 长上下文窗口直接吃论文全文，提升 manim 代码与方法图分析质量。
-21. **Chromium daemon + CDP attach**（Docker 容器自包含写路径方案）：长跑 chromium 进程（Xvfb headed）+ aiohttp 健康检查 endpoint，所有抖音写操作（上传/评论回复）通过 `connect_over_cdp` 复用同一 page，避免反复装载 cookie 触发风控吊销。
-22. **Docker 化容器自包含部署**：`docker compose up -d` 一键起 paperagent + xhs-mcp + chromium-daemon 三个 service，cookie / config / cache 走 volume mount。详见 `docs/DOCKER.md`。
-23. **核心公式讲解 + 自适应 scene**：从论文自动挑选最多 2 个核心公式（损失/目标/核心机制），在 Manim 视频里插入 FormulaScene 逐项讲解——整条公式 Write 出现后，逐项 FadeIn 中文注解 + Indicate 高亮当前项，最后统一 FadeOut。
+15. **三平台关键词动态生成**：每篇论文 LLM 一次产出 B站 / 小红书 / 抖音三平台关键词 dict（不再写死），三层兜底：prompt 约束 + 字符过滤 + 数量上限。
+16. **抖音上传集成**：基于 [`dreammis/social-auto-upload`](https://github.com/dreammis/social-auto-upload) Playwright 路线，子进程跨 venv 调用，含首次扫码登录的容器内二维码暴露流程 + 短信验证码弹窗自动 fill 入口。
+17. **三平台评论自动回复**：B站走 `bilibili-api-python` 官方 API、小红书走 `xhs` 库（SAU venv 子进程）、抖音读路径走 [`Johnserf-Seed/f2`](https://github.com/Johnserf-Seed/f2) mobile API（cookie 月级稳定，跟 PC 创作者中心风控通道隔离）+ 写路径走 chromium daemon CDP。LLM 活泼互动人设统一回复，sqlite 去重 + 日上限节流（B站 50/小红书 15/抖音 20）。
+18. **创作者中心数据聚合**：B站直接 API；小红书/抖音 mobile API（f2）；sqlite 存储 + ASCII summary 表 + CLI 子命令 (`fetch` / `summary`)；可选飞书多维表格上报（stub，需配置 lark 凭证）。
+19. **Manim-only 模式**：`--manim` 时跳过 main video 渲染（节省 60-95 分钟），仅生成 manim 视频作为最终输出。`paperagent_workflow.generate_daily_arxiv_summary(skip_main_video=True)` 控制；`structured_plan` + `paper_text` 同步缓存到 `cache/` 供后续 manim 阶段读取。
+20. **Manim 累加显示 + 文字重叠守卫**：单屏 5 个元素以内禁止中途 FadeOut，元素累加 FadeIn 直至本场景结束统一一次 FadeOut；`_ensure_page_fadeouts` 已禁用避免 post-process 强插中间 FadeOut。`_inject_text_overlap_guard` 运行时包裹 `self.play`，每次播放后按包围盒检测文字 mobject 重叠（交叠面积 / **较大块面积** > 0.5，要求两块大幅互相重合才判定为糊成一团），只保留最上层（最新/ z_index 最高）文字，把被遮挡的下层文字 FadeOut —— 即"新文字出现后只显示最上层的文字"，不重叠的文字仍累加保留。文字类型用 `isinstance` 识别（覆盖 Title 等子类）；阈值用较大块面积归一化，避免小标签压在大段落角落时误删整段。
+21. **opencode 全文上下文**：取消论文文本截取（之前 `[:2000]` / `[:1500]`），DeepSeek-V4-Pro 长上下文窗口直接吃论文全文，提升 manim 代码与方法图分析质量。
+22. **Chromium daemon + CDP attach**（Docker 容器自包含写路径方案）：长跑 chromium 进程（Xvfb headed）+ aiohttp 健康检查 endpoint，所有抖音写操作（上传/评论回复）通过 `connect_over_cdp` 复用同一 page，避免反复装载 cookie 触发风控吊销。
+23. **Docker 化容器自包含部署**：`docker compose up -d` 一键起 paperagent + xhs-mcp + chromium-daemon 三个 service，cookie / config / cache 走 volume mount。详见 `docs/DOCKER.md`。
+24. **核心公式讲解 + 自适应 scene**：从论文自动挑选最多 2 个核心公式（损失/目标/核心机制），在 Manim 视频里插入 FormulaScene 逐项讲解——整条公式 Write 出现后，逐项 FadeIn 中文注解 + Indicate 高亮当前项，最后统一 FadeOut。
     - **自适应 scene 编排**：固定 4 段（Title/Intro/Method/Results）基础上，按提取到的有效公式数在 **Method 与 Results 之间**插入 FormulaScene；0 公式 → 4 scene（与老链路字节级一致），1 公式 → 5 scene，≥2 公式 → 6 scene。**公式 ≤ 2、总 scene ≤ 6** 为硬上限，超出截断。
     - **源码优先 + LLM 兜底**：有 arxiv_id 且能拉到 `.tex` 源码时，`extract_equations` 抽行间公式候选喂 LLM 精选（最准）；拿不到源码（含 `blog-` 前缀、无 arxiv_id）时回退到让 LLM 直接从正文识别公式。manim 链路已自动透传 arxiv_id（`paperagent_workflow` 两处 plan 调用 + `main.py` fallback）。
     - **渲染前 LaTeX 预编译校验 + 降级**：每条公式 latex 先经 `validate_latex` 子进程预编译，不过则 LLM 修一次，仍不过直接丢弃，杜绝一个语法错的 `MathTex` 炸掉整条视频渲染。
     - **开关**：`JSR_DISABLE_FORMULA=1` 一键关闭公式提取（功能默认开启，回到纯 4 scene）；`JSR_DISABLE_LATEX_VALIDATE=1` 跳过子进程预编译校验（信任输入，CI/无 latex 环境用）。
     - 编排逻辑在 `ManimEngine._build_scene_defs(plan_scripts)`，公式提取在 `llm_tools.llm_agent._extract_core_formulas(text, arxiv_id)`；集成测试见 `tests/test_formula_pipeline.py`。
-24. **JS/Web 示意动画**：从论文自动挑选最多 2 个最值得动起来的场景，由 opencode 生成**自包含 HTML 动画**，headless playwright 逐帧录屏成 mp4，复用 blog 视频链路对齐 TTS 后作为独立 scene 嵌入视频——和公式 scene 平行的一条「外部 mp4 注入」管线。
+25. **JS/Web 示意动画**：从论文自动挑选最多 2 个最值得动起来的场景，由 opencode 生成**自包含 HTML 动画**，headless playwright 逐帧录屏成 mp4，复用 blog 视频链路对齐 TTS 后作为独立 scene 嵌入视频——和公式 scene 平行的一条「外部 mp4 注入」管线。
     - **两类示意**：`concrete`（具象卡通，机器人/操作任务等物理场景）与 `abstract`（抽象机制，算法流程/数据流/网络结构）；plan 层按论文核心任务/机制自动判定 kind。
     - **自适应 scene 编排**：固定 4 段（Title/Intro/Method/Results）基础上，`position=intro_after` 的示意插在 IntroScene 之后、Method 之前（任务引子），`position=method` 的插在 method 区末尾（公式 scene 之后、Results 之前）。**总 scene ≤ 7、额外（公式 + 示意）≤ 3** 为硬上限：公式优先占额度（论文核心），示意用剩余额度且自身上限 2，超出截断丢弃。
     - **技术栈**：标准 **playwright**（非 patchright——其 evaluate 跑在 isolated world，访问不到页面 `window.renderFrame`）+ 复用 `~/.cache/ms-playwright` 已有 chromium（`executable_path` 启动，不必下新版本）+ HTML 侧 `window.renderFrame(n)` **确定性逐帧渲染**（禁 setTimeout/requestAnimationFrame/Date.now，总时长 = `TOTAL_FRAMES/FPS` 精确可控，正好喂 TTS 对齐）。
@@ -522,7 +522,7 @@ JSR_USE_SKILL_RATE_IMAGES=1 JSR_NETWORK_PROFILE=gsjts python src/main.py \
 2. Round 2:自检每个候选——字数 ≤ 20?保留专有名词?有动词?跟历史标题撞车?
 3. Round 3:选 top 1,输出最终标题 + 一句话理由
 
-频道风格约束:`<英文专有名词>: <核心动作或卖点>` 句式,≤ 20 字,保留 CamelCase/ALLCAPS 专有名词(ViTacFormer / BESTRO / VistaBot / π0 等),禁止"首次/突破/震撼/颠覆"等夸张宣传词。CLI 内置 `_sanitize_title_for_channel` + `_enforce_max_len` + `_ensure_proper_noun` 三重代码层兜底,即使 LLM 输出违规也会被自动修正。
+频道风格约束:`<英文专有名词>: <核心动作或卖点>` 句式,≤ 20 字,保留 CamelCase/ALLCAPS 专有名词(ViTacFormer / BESTRO / VistaBot / π0 等),禁止"首次/突破/震撼/颠覆"等夸张宣传词。CLI 内置 `_sanitize_title_for_channel` + `_enforce_max_len` + `_ensure_proper_noun` 三重代码层兜底,即使 LLM 输出违规也会被自动修正。标题清洗(`src/utils/title_cleaner.py`)还会剥离**平台非法可见符号**(尖括号 `<>` / 残缺书名号 `《》` / 零宽·控制字符),避免触发 B站 21009「标题只能包含中文、英文、数字、日文等可见符号」拒稿;上传出口 `orchestrator.upload_generated_content` 再对 `video_title` / `cn_titles` 兜一道 `strip_platform_illegal_chars`,作为 B站/抖音/小红书三平台共用的最后一道防线。
 
 **默认行为不变**:`generate_video_title(text)` 仍走原 LLM 单次。设 `JSR_USE_SKILL_TITLE_CN=1` 后,函数会优先 subprocess 调本 skill;skill 失败时自动 fallback 回原 LLM 单次。返回值始终是 `str` (legacy API 兼容)。
 
@@ -633,3 +633,17 @@ cookie 路线即使有 chromium daemon, 抖音风控仍可能吊销。一劳永�
 ## 许可证
 
 该项目遵循MIT许可证。
+
+
+## 小红书图文卡片模式
+
+小红书渠道改为**只发图文卡片笔记**(视频仅 B站/抖音)。卡片与视频同源:每张图文卡 = 该 scene 的 manim 合成画面(尾帧,含公式/方法图/结果图)+ 对应旁白文字,3:4 竖版。
+
+**用法**:`--platforms` 含 `xiaohongshu` 时自动走卡片图文发布;单独渲染卡片可用:
+
+```bash
+python -m src.distribution.xhs_cards --meta "output/<名>_meta.json" \
+  --cover "output/<名>.png" --out output/xhs_cards
+```
+
+依赖:xhs-mcp 容器(`docker start xhs-mcp`,端口 18060,cookie 寿命约 3 天需 `check_login_status` 复核)。
